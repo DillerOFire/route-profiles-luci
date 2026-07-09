@@ -1,0 +1,123 @@
+# Example profile: default route via AmneziaWG BRR.
+# Copy to brr.toml (or upload via LuCI) and adjust device names.
+#   cp brr.example.toml brr.toml && route-profiles apply brr
+#
+# Remote lists (optional): plain .lst, text Xray lines, sing-box JSON, or binary DBs.
+#   lists = [
+#     "https://example.com/ai.lst",
+#     "xray:https://example.com/geosite-ai.txt",
+#     "sing-box:https://example.com/ai-rules.json",
+#     # V2Fly/Xray geosite.dat / geoip.dat (CATEGORY@url)
+#     "geosite:openai@https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+#     "geoip:private@https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+#     # sing-box geosite.db / geoip.db
+#     "sing-geosite:openai@https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db",
+#     "sing-geoip:cn@https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db",
+#     # sing-box binary rule-set (whole file; no category)
+#     "srs:https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs",
+#   ]
+
+name = "BRR"
+description = "Default route via AmneziaWG BRR server"
+
+[route]
+type = "interface"
+device = "awg_brr"
+
+# Selective domain routing — one block per device (up to 8 enabled).
+# Forms:
+#   [selective]           legacy single block
+#   [selective.<name>]    named block (recommended for multiple devices)
+#   [[selective]]         TOML array-of-tables
+#
+# Example multi-device layout (uncomment and adjust):
+#   [selective.ai]
+#   enabled = true
+#   device = "awg_brr"
+#   domains = ["chatgpt.com", "claude.ai"]
+#
+#   [selective.warp]
+#   enabled = true
+#   device = "awg_warp"
+#   domains = ["discord.com"]
+
+[selective]
+enabled = false
+device = "awg_brr"
+# Inline domains + optional remote lists are merged, then resolved to IPs.
+lists = []
+domains = [
+  # Google AI / Gemini
+  "gemini.google.com",
+  "generativelanguage.googleapis.com",
+  "ai.google.dev",
+  "aiplatform.googleapis.com",
+  "aistudio.google.com",
+  "deepmind.google",
+
+  # OpenAI / ChatGPT
+  "api.openai.com",
+  "chatgpt.com",
+  "chat.openai.com",
+  "platform.openai.com",
+  "oaistatic.com",
+  "cdn.oaistatic.com",
+
+  # Anthropic / Claude
+  "api.anthropic.com",
+  "claude.ai",
+  "console.anthropic.com",
+
+  # Cursor
+  "cursor.sh",
+  "api.cursor.sh",
+  "api2.cursor.sh",
+  "repo.cursor.sh",
+
+  # GitHub Copilot
+  "api.githubcopilot.com",
+  "copilot-proxy.githubusercontent.com",
+
+  # OpenCode
+  "opencode.ai",
+  "api.opencode.ai",
+
+  # OpenRouter
+  "openrouter.ai",
+  "api.openrouter.ai",
+
+  # DeepSeek
+  "api.deepseek.com",
+  "deepseek.com",
+  "chat.deepseek.com",
+
+  # Vertex AI / Devin
+  "vertex.ai",
+  "devin.ai",
+  "cognition.com",
+
+  # Grok / xAI
+  "x.com",
+  "grok.com",
+  "x.ai",
+  "api.x.ai",
+
+  # Other AI
+  "github.com",
+  "api.groq.com",
+  "groq.com",
+  "api.mistral.ai",
+  "console.mistral.ai",
+  "api.perplexity.ai",
+  "perplexity.ai",
+]
+
+[geoip]
+enabled = false
+source_url = "https://www.ipdeny.com/ipblocks/data/countries/ru.zone"
+lists = []
+domains = [
+  "ozon.ru",
+  "2ip.ru",
+  "pally.info",
+]

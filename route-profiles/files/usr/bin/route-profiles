@@ -1,0 +1,2244 @@
+#!/bin/sh
+# route-profiles — TOML profile-driven routing policy for OpenWrt
+# Profiles: /etc/route-profiles/profiles/<id>.toml
+
+export PATH="/usr/bin:/usr/sbin:/bin:/sbin"
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+# Legacy single-selective (v1/v2.0) — still torn down for upgrades
+AI_TABLE_ID="101"
+AI_TABLE_NAME="ai_vpn"
+AI_FWMARK_HEX="0x3"
+AI_NF_FAMILY="inet"
+AI_NF_TABLE="ai_route"
+AI_NF_SET="ai_domains"
+
+# Multi-selective slots: table 110+N, fwmark 0x10+N, nft table sel_route_N
+SEL_SLOT_TABLE_BASE="110"
+SEL_SLOT_MARK_BASE="16"	# 0x10
+SEL_SLOT_MAX="8"
+SEL_NF_FAMILY="inet"
+SEL_NF_SET="domains"
+
+GEOIP_TABLE_ID="102"
+GEOIP_TABLE_NAME="geoip_wan"
+GEOIP_FWMARK_HEX="0x4"
+GEOIP_NF_FAMILY="inet"
+GEOIP_NF_TABLE="geoip_route"
+GEOIP_NF_SET="geoip_prefixes"
+GEOIP_DOMAIN_SET="geoip_domains"
+
+DOMAIN_TIMEOUT="3600"
+UPLOAD_TMP="/tmp/route-profiles-upload.toml"
+
+# Parsed profile fields (set by profile_parse)
+P_NAME=""
+P_DESCRIPTION=""
+P_ROUTE_TYPE=""
+P_ROUTE_DEVICE=""
+P_ROUTE_GATEWAY=""
+# Multi-selective: P_SEL_COUNT entries; blob is SEL/DOM/LST/END records
+P_SEL_COUNT="0"
+P_SEL_BLOB=""
+P_SEL_ANY="false"
+# First selective (compat for migrate writer / simple status)
+P_SEL_ENABLED=""
+P_SEL_DEVICE=""
+P_SEL_DOMAINS=""
+P_SEL_LISTS=""
+P_GEO_ENABLED=""
+P_GEO_SOURCE=""
+P_GEO_DOMAINS=""
+P_GEO_LISTS=""
+
+# ---------------------------------------------------------------------------
+# UCI helpers
+# ---------------------------------------------------------------------------
+uci_get() {
+	uci -q get "route-profiles.$1" 2>/dev/null || echo "$2"
+}
+
+uci_set() {
+	uci set "route-profiles.$1=$2" 2>/dev/null
+}
+
+uci_commit_vs() {
+	uci commit route-profiles 2>/dev/null
+}
+
+profiles_dir() {
+	uci_get "settings.profiles_dir" "/etc/route-profiles/profiles"
+}
+
+wan_dev() {
+	uci_get "settings.wan_dev" "wan"
+}
+
+# Prefer UCI, then live ifstatus/DHCP default, then last-resort fallback
+wan_gw() {
+	local gw dev
+	gw=$(uci_get "settings.wan_gw" "")
+	if [ -n "$gw" ]; then
+		printf '%s' "$gw"
+		return
+	fi
+	dev=$(wan_dev)
+	# netifd ifstatus (jsonfilter on OpenWrt)
+	if command -v jsonfilter >/dev/null 2>&1 && command -v ifstatus >/dev/null 2>&1; then
+		gw=$(ifstatus "$dev" 2>/dev/null | jsonfilter -e '@.route[@.target="0.0.0.0"].nexthop' 2>/dev/null | head -n1)
+		[ -z "$gw" ] && gw=$(ifstatus "$dev" 2>/dev/null | jsonfilter -e '@.route[0].nexthop' 2>/dev/null | head -n1)
+	fi
+	if [ -z "$gw" ]; then
+		gw=$(ip -4 route show dev "$dev" 2>/dev/null | awk '/default/ {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+	fi
+	if [ -z "$gw" ]; then
+		gw=$(ip -4 route show default 2>/dev/null | awk '/dev '"$dev"'/ {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+	fi
+	printf '%s' "${gw:-}"
+}
+
+active_id() {
+	uci_get "settings.active" "direct"
+}
+
+set_active() {
+	uci_set "settings.active" "$1"
+	uci_commit_vs
+}
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+profile_path() {
+	local id="$1"
+	echo "$(profiles_dir)/${id}.toml"
+}
+
+cache_dir() {
+	echo "/etc/route-profiles/cache"
+}
+
+# Cache path derived from source URL basename (e.g. ru.zone → geoip-ru.zone)
+geoip_cache_file() {
+	local source="$1"
+	local base
+	base=$(basename "$source" 2>/dev/null | sed 's/[^a-zA-Z0-9._-]/_/g')
+	[ -z "$base" ] || [ "$base" = "/" ] && base="prefixes.zone"
+	echo "$(cache_dir)/geoip-${base}"
+}
+
+geoip_tmp_tag() {
+	local source="$1"
+	local base
+	base=$(basename "$source" 2>/dev/null | sed 's/[^a-zA-Z0-9._-]/_/g')
+	[ -z "$base" ] && base="prefixes"
+	printf '%s' "$base"
+}
+
+# ---------------------------------------------------------------------------
+# TOML subset parser
+# Supports: comments, "strings", true/false, [sections], domains = [ ... ]
+# ---------------------------------------------------------------------------
+profile_clear() {
+	P_NAME=""
+	P_DESCRIPTION=""
+	P_ROUTE_TYPE=""
+	P_ROUTE_DEVICE=""
+	P_ROUTE_GATEWAY=""
+	P_SEL_COUNT="0"
+	P_SEL_BLOB=""
+	P_SEL_ANY="false"
+	P_SEL_ENABLED="false"
+	P_SEL_DEVICE=""
+	P_SEL_DOMAINS=""
+	P_SEL_LISTS=""
+	P_GEO_ENABLED="false"
+	P_GEO_SOURCE="https://www.ipdeny.com/ipblocks/data/countries/ru.zone"
+	P_GEO_DOMAINS=""
+	P_GEO_LISTS=""
+}
+
+# Slot helpers (index 0..SEL_SLOT_MAX-1)
+sel_slot_table_id() {
+	echo $((SEL_SLOT_TABLE_BASE + $1))
+}
+
+sel_slot_table_name() {
+	echo "sel_vpn_$1"
+}
+
+sel_slot_mark_hex() {
+	printf '0x%x' $((SEL_SLOT_MARK_BASE + $1))
+}
+
+sel_slot_nft_table() {
+	echo "sel_route_$1"
+}
+
+# Sanitize label for display (from section name)
+sel_section_label() {
+	local s="$1"
+	case "$s" in
+		selective) echo "default" ;;
+		selective.*) echo "${s#selective.}" ;;
+		\[\[selective\]\]#*) echo "sel${s##*#}" ;;
+		*) echo "$s" ;;
+	esac
+}
+
+# Extract unquoted or "quoted" value after first = (pure shell, no sed)
+_toml_value() {
+	local line="$1" val
+	val=${line#*=}
+	# trim leading spaces/tabs
+	while [ "${val# }" != "$val" ]; do val=${val# }; done
+	while [ "${val#	}" != "$val" ]; do val=${val#	}; done
+	case "$val" in
+		\"*)
+			val=${val#\"}
+			val=${val%%\"*}
+			;;
+		*)
+			# strip trailing comment and whitespace
+			val=${val%%#*}
+			while [ "${val% }" != "$val" ]; do val=${val% }; done
+			while [ "${val%	}" != "$val" ]; do val=${val%	}; done
+			;;
+	esac
+	printf '%s' "$val"
+}
+
+_trim_lead() {
+	local s="$1"
+	while [ "${s# }" != "$s" ]; do s=${s# }; done
+	while [ "${s#	}" != "$s" ]; do s=${s#	}; done
+	printf '%s' "$s"
+}
+
+# Quick name only (for list UI — avoids full parse)
+profile_name_quick() {
+	local file="$1" line val
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=$(_trim_lead "$line")
+		case "$line" in
+			'['*) return 0 ;; # past top-level keys
+			name=*|name\ =*|name\	=*)
+				val=$(_toml_value "$line")
+				if [ -n "$val" ]; then
+					printf '%s' "$val"
+					return 0
+				fi
+				;;
+		esac
+	done < "$file"
+	basename "$file" .toml
+}
+
+# profile_parse <file> [meta]
+# meta = skip domains/lists arrays (fast path for status/list)
+# Selective supports:
+#   [selective]              — legacy single block
+#   [selective.<name>]       — additional named blocks (different devices)
+#   [[selective]]            — TOML array-of-tables (multiple devices)
+profile_parse() {
+	local file="$1"
+	local mode="${2:-full}"
+	local section="" line key val
+
+	profile_clear
+
+	if [ ! -r "$file" ]; then
+		echo "Error: cannot read profile $file" >&2
+		return 1
+	fi
+
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=$(_trim_lead "$line")
+		case "$line" in
+			""|\#*) continue ;;
+			\[\[selective\]\])
+				section="[[selective]]"
+				continue
+				;;
+			\[*\])
+				section=${line#\[}
+				section=${section%%]*}
+				section=$(_trim_lead "$section")
+				continue
+				;;
+		esac
+
+		key=${line%%=*}
+		while [ "${key% }" != "$key" ]; do key=${key% }; done
+		while [ "${key%	}" != "$key" ]; do key=${key%	}; done
+
+		case "$key" in
+			domains|lists) continue ;;
+		esac
+
+		val=$(_toml_value "$line")
+		case "$section" in
+			"")
+				case "$key" in
+					name) P_NAME="$val" ;;
+					description) P_DESCRIPTION="$val" ;;
+				esac
+				;;
+			route)
+				case "$key" in
+					type) P_ROUTE_TYPE="$val" ;;
+					device) P_ROUTE_DEVICE="$val" ;;
+					gateway) P_ROUTE_GATEWAY="$val" ;;
+				esac
+				;;
+			geoip)
+				case "$key" in
+					enabled) P_GEO_ENABLED="$val" ;;
+					source_url) P_GEO_SOURCE="$val" ;;
+				esac
+				;;
+		esac
+	done < "$file"
+
+	# Multi-selective dump (always — meta only needs enabled/device lines)
+	P_SEL_BLOB=$(_parse_selective_blocks "$file" "$mode")
+	_sel_load_from_blob
+
+	# GeoIP arrays only when fully applying/updating
+	if [ "$mode" != "meta" ]; then
+		P_GEO_DOMAINS=$(_extract_string_array "$file" "geoip" "domains")
+		P_GEO_LISTS=$(_extract_string_array "$file" "geoip" "lists")
+	fi
+
+	# Defaults
+	[ -z "$P_SEL_ENABLED" ] && P_SEL_ENABLED="false"
+	[ -z "$P_GEO_ENABLED" ] && P_GEO_ENABLED="false"
+	[ -z "$P_GEO_SOURCE" ] && P_GEO_SOURCE="https://www.ipdeny.com/ipblocks/data/countries/ru.zone"
+	[ -z "$P_NAME" ] && P_NAME=$(basename "$file" .toml)
+
+	return 0
+}
+
+# Dump all selective blocks from a profile.
+# Records:
+#   SEL <idx> <label> <enabled> <device>
+#   DOM <idx> <domain>          (full mode only)
+#   LST <idx> <list-entry>      (full mode only)
+#   END <idx>
+_parse_selective_blocks() {
+	local file="$1"
+	local mode="${2:-full}"
+
+	awk -v mode="$mode" '
+		function trim(s) {
+			sub(/^[[:space:]]+/, "", s)
+			sub(/[[:space:]]+$/, "", s)
+			return s
+		}
+		function unquote(s) {
+			s = trim(s)
+			if (s ~ /^"/) {
+				sub(/^"/, "", s)
+				sub(/".*$/, "", s)
+			} else {
+				sub(/#.*$/, "", s)
+				s = trim(s)
+			}
+			return s
+		}
+		function finish_array() { in_array = 0; array_key = "" }
+		function emit_sel() {
+			if (idx < 0) return
+			if (label == "") label = "sel" idx
+			if (enabled == "") enabled = "false"
+			print "SEL", idx, label, enabled, device
+			if (mode != "meta") {
+				n = split(domains, da, "\n")
+				for (i = 1; i <= n; i++) if (da[i] != "") print "DOM", idx, da[i]
+				n = split(lists, la, "\n")
+				for (i = 1; i <= n; i++) if (la[i] != "") print "LST", idx, la[i]
+			}
+			print "END", idx
+		}
+		function start_sel(lbl) {
+			if (idx >= 0) emit_sel()
+			idx++
+			label = lbl
+			enabled = "false"
+			device = ""
+			domains = ""
+			lists = ""
+			finish_array()
+		}
+		BEGIN {
+			idx = -1
+			in_sel = 0
+			in_array = 0
+			array_key = ""
+		}
+		{
+			line = $0
+			sub(/^[[:space:]]+/, "", line)
+			if (line == "" || line ~ /^#/) next
+
+			if (line ~ /^\[\[selective\]\][[:space:]]*$/) {
+				start_sel("sel" (idx + 1))
+				in_sel = 1
+				next
+			}
+			if (line ~ /^\[/) {
+				sec = line
+				sub(/^\[/, "", sec)
+				sub(/\][[:space:]]*$/, "", sec)
+				sec = trim(sec)
+				if (sec == "selective") {
+					start_sel("default")
+					in_sel = 1
+					next
+				}
+				if (sec ~ /^selective\./) {
+					lbl = sec
+					sub(/^selective\./, "", lbl)
+					start_sel(lbl)
+					in_sel = 1
+					next
+				}
+				# leaving selective
+				if (in_sel) { emit_sel(); idx = -1 }
+				in_sel = 0
+				finish_array()
+				next
+			}
+			if (!in_sel) next
+
+			if (in_array) {
+				tmp = line
+				while (match(tmp, /"[^"]*"/)) {
+					s = substr(tmp, RSTART + 1, RLENGTH - 2)
+					if (s != "") {
+						if (array_key == "domains") {
+							if (domains != "") domains = domains "\n"
+							domains = domains s
+						} else if (array_key == "lists") {
+							if (lists != "") lists = lists "\n"
+							lists = lists s
+						}
+					}
+					tmp = substr(tmp, RSTART + RLENGTH)
+				}
+				if (index(line, "]") > 0) finish_array()
+				next
+			}
+
+			key = line
+			sub(/[[:space:]]*=.*/, "", key)
+			key = trim(key)
+			if (key == "domains" || key == "lists") {
+				in_array = 1
+				array_key = key
+				tmp = line
+				sub(/^[^=]*=/, "", tmp)
+				while (match(tmp, /"[^"]*"/)) {
+					s = substr(tmp, RSTART + 1, RLENGTH - 2)
+					if (s != "") {
+						if (array_key == "domains") {
+							if (domains != "") domains = domains "\n"
+							domains = domains s
+						} else if (array_key == "lists") {
+							if (lists != "") lists = lists "\n"
+							lists = lists s
+						}
+					}
+					tmp = substr(tmp, RSTART + RLENGTH)
+				}
+				if (index(line, "]") > 0) finish_array()
+				next
+			}
+
+			rest = line
+			sub(/^[^=]*=/, "", rest)
+			val = unquote(rest)
+			if (key == "enabled") enabled = val
+			else if (key == "device") device = val
+			else if (key == "name" || key == "id" || key == "label") {
+				if (val != "") label = val
+			}
+		}
+		END {
+			if (in_sel && idx >= 0) emit_sel()
+		}
+	' "$file"
+}
+
+# Populate P_SEL_* globals from P_SEL_BLOB
+_sel_load_from_blob() {
+	local line kind idx label en dev rest
+	local tmp="/tmp/route-profiles-sel-load.$$"
+
+	P_SEL_COUNT=0
+	P_SEL_ANY="false"
+	P_SEL_ENABLED="false"
+	P_SEL_DEVICE=""
+	P_SEL_DOMAINS=""
+	P_SEL_LISTS=""
+
+	[ -z "$P_SEL_BLOB" ] && return 0
+
+	printf '%s\n' "$P_SEL_BLOB" > "$tmp"
+	while IFS= read -r line || [ -n "$line" ]; do
+		[ -z "$line" ] && continue
+		case "$line" in
+			SEL\ *)
+				# SEL idx label enabled [device]
+				set -- $line
+				idx=$2
+				label=$3
+				en=${4:-false}
+				dev=${5:-}
+				P_SEL_COUNT=$((P_SEL_COUNT + 1))
+				[ "$en" = "true" ] && P_SEL_ANY="true"
+				if [ "$idx" = "0" ]; then
+					P_SEL_ENABLED="$en"
+					P_SEL_DEVICE="$dev"
+				fi
+				;;
+		esac
+	done < "$tmp"
+	rm -f "$tmp"
+
+	if [ "$P_SEL_COUNT" -gt 0 ]; then
+		P_SEL_DOMAINS=$(_sel_blob_field "0" "DOM")
+		P_SEL_LISTS=$(_sel_blob_field "0" "LST")
+	fi
+}
+
+# Extract DOM or LST lines for selective index from P_SEL_BLOB
+_sel_blob_field() {
+	local want_idx="$1"
+	local want_kind="$2"
+	local line kind idx val
+	printf '%s\n' "$P_SEL_BLOB" | while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		kind=${line%% *}
+		[ "$kind" = "$want_kind" ] || continue
+		rest=${line#* }
+		idx=${rest%% *}
+		val=${rest#* }
+		[ "$idx" = "$want_idx" ] || continue
+		printf '%s\n' "$val"
+	done
+}
+
+# Iterate enabled selective entries: callback via stdout lines
+# Prints: idx|label|device
+_sel_enabled_entries() {
+	local line idx label en dev
+	printf '%s\n' "$P_SEL_BLOB" | while IFS= read -r line; do
+		case "$line" in
+			SEL\ *)
+				set -- $line
+				# SEL idx label enabled device...
+				idx=$2
+				label=$3
+				en=$4
+				dev=$5
+				[ "$en" = "true" ] || continue
+				printf '%s|%s|%s\n' "$idx" "$label" "$dev"
+				;;
+		esac
+	done
+}
+
+# Extract a string array key from a TOML section (single awk pass)
+_extract_string_array() {
+	local file="$1"
+	local want="$2"
+	local array_key="$3"
+
+	awk -v want="$want" -v akey="$array_key" '
+		BEGIN { section=""; in_array=0 }
+		{
+			line=$0
+			sub(/^[[:space:]]+/, "", line)
+			if (line == "" || line ~ /^#/) next
+			if (line ~ /^\[/) {
+				section=line
+				gsub(/^\[|\][[:space:]]*$/, "", section)
+				in_array=0
+				next
+			}
+			if (section != want) next
+			if (!in_array) {
+				if (line ~ ("^" akey "[[:space:]]*=")) in_array=1
+				else next
+			}
+			while (match(line, /"[^"]*"/)) {
+				s=substr(line, RSTART+1, RLENGTH-2)
+				if (s != "") print s
+				line=substr(line, RSTART+RLENGTH)
+			}
+			if (index($0, "]") > 0) in_array=0
+		}
+	' "$file"
+}
+
+profile_validate() {
+	local line idx label en dev n_enabled
+	local tmp="/tmp/route-profiles-sel-val.$$"
+	local new_blob="" fixed=0
+
+	case "$P_ROUTE_TYPE" in
+		direct|interface) ;;
+		*)
+			echo "Error: route.type must be 'direct' or 'interface' (got '$P_ROUTE_TYPE')" >&2
+			return 1
+			;;
+	esac
+	if [ "$P_ROUTE_TYPE" = "interface" ] && [ -z "$P_ROUTE_DEVICE" ]; then
+		echo "Error: route.device is required when route.type=interface" >&2
+		return 1
+	fi
+
+	# Validate each selective block; fill empty device from route.device when possible
+	n_enabled=0
+	printf '%s\n' "$P_SEL_BLOB" > "$tmp"
+	while IFS= read -r line || [ -n "$line" ]; do
+		[ -z "$line" ] && continue
+		case "$line" in
+			SEL\ *)
+				set -- $line
+				idx=$2; label=$3; en=$4; dev=$5
+				if [ "$en" = "true" ]; then
+					if [ -z "$dev" ]; then
+						if [ -n "$P_ROUTE_DEVICE" ] && [ "$P_ROUTE_TYPE" = "interface" ]; then
+							dev="$P_ROUTE_DEVICE"
+							fixed=1
+							line="SEL $idx $label $en $dev"
+							if [ "$idx" = "0" ]; then
+								P_SEL_DEVICE="$dev"
+							fi
+						else
+							rm -f "$tmp"
+							echo "Error: selective '$label' needs device= when enabled (or set route.device)" >&2
+							return 1
+						fi
+					fi
+					n_enabled=$((n_enabled + 1))
+					if [ "$n_enabled" -gt "$SEL_SLOT_MAX" ]; then
+						rm -f "$tmp"
+						echo "Error: at most $SEL_SLOT_MAX enabled selective blocks supported" >&2
+						return 1
+					fi
+				fi
+				;;
+		esac
+		new_blob="${new_blob}${line}
+"
+	done < "$tmp"
+	rm -f "$tmp"
+
+	if [ "$fixed" -eq 1 ]; then
+		P_SEL_BLOB="$new_blob"
+	fi
+	if [ "$n_enabled" -gt 0 ]; then
+		P_SEL_ANY="true"
+	else
+		P_SEL_ANY="false"
+	fi
+	# Compat: first block
+	if [ -z "$P_SEL_ENABLED" ]; then
+		P_SEL_ENABLED="false"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# TOML writer (migrate)
+# ---------------------------------------------------------------------------
+_toml_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g;s/"/\\"/g'
+}
+
+_write_string_array() {
+	local key="$1"
+	local values="$2"
+	local d
+	printf '%s = [\n' "$key"
+	if [ -n "$values" ]; then
+		printf '%s\n' "$values" | while IFS= read -r d; do
+			[ -z "$d" ] && continue
+			printf '\t"%s",\n' "$(_toml_escape "$d")"
+		done
+	fi
+	echo "]"
+}
+
+# write_profile <outpath>
+# Uses globals W_NAME W_DESC W_RTYPE W_RDEV W_RGW W_SEL_EN W_SEL_DEV
+# W_SEL_DOMAINS W_SEL_LISTS W_GEO_EN W_GEO_SOURCE W_GEO_DOMAINS W_GEO_LISTS
+write_profile() {
+	local out="$1"
+
+	{
+		printf 'name = "%s"\n' "$(_toml_escape "${W_NAME}")"
+		printf 'description = "%s"\n' "$(_toml_escape "${W_DESC}")"
+		echo ""
+		echo "[route]"
+		printf 'type = "%s"\n' "$(_toml_escape "${W_RTYPE}")"
+		if [ -n "$W_RDEV" ]; then
+			printf 'device = "%s"\n' "$(_toml_escape "$W_RDEV")"
+		fi
+		if [ -n "$W_RGW" ]; then
+			printf 'gateway = "%s"\n' "$(_toml_escape "$W_RGW")"
+		fi
+		echo ""
+		echo "[selective]"
+		printf 'enabled = %s\n' "${W_SEL_EN:-false}"
+		if [ -n "$W_SEL_DEV" ]; then
+			printf 'device = "%s"\n' "$(_toml_escape "$W_SEL_DEV")"
+		fi
+		_write_string_array "domains" "$W_SEL_DOMAINS"
+		_write_string_array "lists" "${W_SEL_LISTS:-}"
+		echo ""
+		echo "[geoip]"
+		printf 'enabled = %s\n' "${W_GEO_EN:-false}"
+		if [ -n "$W_GEO_SOURCE" ]; then
+			printf 'source_url = "%s"\n' "$(_toml_escape "$W_GEO_SOURCE")"
+		fi
+		_write_string_array "domains" "$W_GEO_DOMAINS"
+		_write_string_array "lists" "${W_GEO_LISTS:-}"
+	} > "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Domain / IP helpers
+# ---------------------------------------------------------------------------
+domains_from_file() {
+	local file="$1"
+	[ -r "$file" ] || return 0
+	while IFS= read -r domain || [ -n "$domain" ]; do
+		case "$domain" in
+			""|\#*) continue ;;
+		esac
+		case "$domain" in
+			\*.*) domain=${domain#*.} ;;
+		esac
+		printf '%s\n' "$domain"
+	done < "$file"
+}
+
+is_ipv4_or_cidr() {
+	echo "$1" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'
+}
+
+is_domain_like() {
+	echo "$1" | grep -qiE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+}
+
+normalize_target() {
+	local t="$1"
+	t=$(printf '%s' "$t" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+	case "$t" in
+		""|\#*) return 1 ;;
+		\*.*) t=${t#*.} ;;
+		.*) t=${t#.} ;;
+	esac
+	# strip trailing dot
+	t=$(printf '%s' "$t" | sed 's/\.$//')
+	[ -n "$t" ] || return 1
+	printf '%s' "$t"
+}
+
+resolve_domain_ipv4() {
+	local domain="$1"
+	local tmp="/tmp/route-profiles-resolve.$$"
+	local pid i
+
+	nslookup "$domain" > "$tmp" 2>/dev/null &
+	pid=$!
+	for i in 1 2 3 4 5; do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 1
+	done
+	if kill -0 "$pid" 2>/dev/null; then
+		kill "$pid" 2>/dev/null
+		wait "$pid" 2>/dev/null
+	fi
+
+	grep '^Address:' "$tmp" 2>/dev/null | \
+		grep -v '::' | \
+		awk '{print $NF}' | \
+		grep -vE '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.|0\.)' || true
+	rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Remote lists: lst | xray-text | sing-box JSON | binary geo DBs
+# Entry forms:
+#   https://host/path.lst
+#   lst:https://...
+#   xray:https://...                  # text geosite-style lines
+#   sing-box:https://...json          # source rule-set JSON (aliases: singbox:, sb:)
+#   geosite:CATEGORY@URL_OR_PATH      # V2Fly/Xray geosite.dat
+#   geoip:CATEGORY@URL_OR_PATH        # V2Fly/Xray geoip.dat
+#   sing-geosite:CATEGORY@URL_OR_PATH # sing-box geosite.db
+#   sing-geoip:CATEGORY@URL_OR_PATH   # sing-box geoip.db
+#   srs:URL_OR_PATH                   # sing-box binary rule-set (.srs)
+#   /local/path.lst
+# CATEGORY@ is required for multi-list DBs (.dat / .db).
+# ---------------------------------------------------------------------------
+list_split_entry() {
+	# sets LIST_FORMAT, LIST_URL, LIST_CATEGORY
+	local entry="$1" rest
+	LIST_FORMAT="auto"
+	LIST_URL="$entry"
+	LIST_CATEGORY=""
+	case "$entry" in
+		lst:*)
+			LIST_FORMAT="lst"
+			LIST_URL=${entry#lst:}
+			;;
+		list:*)
+			LIST_FORMAT="lst"
+			LIST_URL=${entry#list:}
+			;;
+		xray:*)
+			LIST_FORMAT="xray"
+			LIST_URL=${entry#xray:}
+			;;
+		v2ray:*)
+			LIST_FORMAT="xray"
+			LIST_URL=${entry#v2ray:}
+			;;
+		sing-box:*)
+			LIST_FORMAT="singbox"
+			LIST_URL=${entry#sing-box:}
+			;;
+		singbox:*)
+			LIST_FORMAT="singbox"
+			LIST_URL=${entry#singbox:}
+			;;
+		sb:*)
+			LIST_FORMAT="singbox"
+			LIST_URL=${entry#sb:}
+			;;
+		geosite:*)
+			LIST_FORMAT="geosite-dat"
+			LIST_URL=${entry#geosite:}
+			;;
+		geoip:*)
+			LIST_FORMAT="geoip-dat"
+			LIST_URL=${entry#geoip:}
+			;;
+		sing-geosite:*|singbox-geosite:*|sb-geosite:*)
+			LIST_FORMAT="geosite-db"
+			rest=${entry#*:}
+			LIST_URL="$rest"
+			;;
+		sing-geoip:*|singbox-geoip:*|sb-geoip:*)
+			LIST_FORMAT="geoip-db"
+			rest=${entry#*:}
+			LIST_URL="$rest"
+			;;
+		srs:*|rule-set:*)
+			LIST_FORMAT="srs"
+			LIST_URL=${entry#*:}
+			;;
+	esac
+	# CATEGORY@url — only when @ precedes a URL/path (http, https, absolute, relative)
+	case "$LIST_URL" in
+		*@http://*|*@https://*|*@/*|*@./*|*@../*)
+			LIST_CATEGORY=${LIST_URL%%@*}
+			LIST_URL=${LIST_URL#*@}
+			;;
+	esac
+	# If user wrote xray:cat@file.dat / sing-box:cat@file.db, promote to binary
+	case "$LIST_FORMAT" in
+		xray)
+			case "$LIST_URL" in
+				*.dat|*.DAT)
+					[ -n "$LIST_CATEGORY" ] && LIST_FORMAT="geosite-dat"
+					;;
+			esac
+			;;
+		singbox)
+			case "$LIST_URL" in
+				*.srs|*.SRS)
+					LIST_FORMAT="srs"
+					;;
+				*.db|*.DB)
+					if [ -n "$LIST_CATEGORY" ]; then
+						# prefer geosite unless name hints geoip
+						case "$LIST_URL" in
+							*geoip*|*GeoIP*) LIST_FORMAT="geoip-db" ;;
+							*) LIST_FORMAT="geosite-db" ;;
+						esac
+					fi
+					;;
+			esac
+			;;
+	esac
+	# file:// → path
+	case "$LIST_URL" in
+		file://*) LIST_URL=${LIST_URL#file://} ;;
+	esac
+}
+
+list_detect_format() {
+	local file="$1"
+	local head magic
+	# Binary: SRS magic / MaxMind MMDB trailer / protobuf-ish .dat left to explicit prefix
+	magic=$(head -c 3 "$file" 2>/dev/null || true)
+	if [ "$magic" = "SRS" ]; then
+		echo "srs"
+		return
+	fi
+	if tail -c 32 "$file" 2>/dev/null | grep -q 'MaxMind.com' 2>/dev/null; then
+		echo "geoip-db"
+		return
+	fi
+	head=$(head -c 512 "$file" 2>/dev/null || true)
+	case "$head" in
+		\{*|\[*)
+			if grep -qE '"domain(_suffix|_keyword|_regex)?"|"ip_cidr"|"rules"' "$file" 2>/dev/null; then
+				echo "singbox"
+				return
+			fi
+			echo "singbox"
+			return
+			;;
+	esac
+	if grep -qE '^(domain:|full:|keyword:|regexp:|geosite:|ext:)' "$file" 2>/dev/null; then
+		echo "xray"
+		return
+	fi
+	# geosite.db starts with version byte 0 — only treat as such when category set by caller
+	echo "lst"
+}
+
+list_fetch() {
+	local url="$1"
+	local out="$2"
+	case "$url" in
+		http://*|https://*)
+			if wget -q -O "$out" "$url" 2>/dev/null; then
+				return 0
+			fi
+			return 1
+			;;
+		/*|./*)
+			if [ -r "$url" ]; then
+				cp "$url" "$out"
+				return 0
+			fi
+			return 1
+			;;
+		*)
+			# bare relative path under /etc/route-profiles
+			if [ -r "$url" ]; then
+				cp "$url" "$out"
+				return 0
+			fi
+			if [ -r "/etc/route-profiles/$url" ]; then
+				cp "/etc/route-profiles/$url" "$out"
+				return 0
+			fi
+			return 1
+			;;
+	esac
+}
+
+# Parse plain .lst: one domain or IPv4/CIDR per line
+parse_list_lst() {
+	local file="$1"
+	local line t
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=$(printf '%s' "$line" | sed 's/#.*//;s/^[[:space:]]*//;s/[[:space:]]*$//')
+		[ -z "$line" ] && continue
+		t=$(normalize_target "$line") || continue
+		if is_ipv4_or_cidr "$t" || is_domain_like "$t"; then
+			printf '%s\n' "$t"
+		fi
+	done < "$file"
+}
+
+# Parse Xray/V2Ray domain list lines
+parse_list_xray() {
+	local file="$1"
+	local line kind rest t
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=$(printf '%s' "$line" | sed 's/#.*//;s/^[[:space:]]*//;s/[[:space:]]*$//')
+		[ -z "$line" ] && continue
+		case "$line" in
+			domain:*)
+				rest=${line#domain:}
+				t=$(normalize_target "$rest") || continue
+				is_domain_like "$t" && printf '%s\n' "$t"
+				;;
+			full:*)
+				rest=${line#full:}
+				t=$(normalize_target "$rest") || continue
+				is_domain_like "$t" && printf '%s\n' "$t"
+				;;
+			# keyword/regexp/geosite cannot be resolved as a single host
+			keyword:*|regexp:*|geosite:*|ext:*|attribute:*)
+				continue
+				;;
+			*)
+				# bare domain or IP
+				t=$(normalize_target "$line") || continue
+				if is_ipv4_or_cidr "$t" || is_domain_like "$t"; then
+					printf '%s\n' "$t"
+				fi
+				;;
+		esac
+	done < "$file"
+}
+
+# Parse sing-box source rule-set JSON (and similar domain JSON)
+parse_list_singbox() {
+	local file="$1"
+	local tmp="/tmp/route-profiles-sb-$$.txt"
+
+	# Prefer jsonfilter when available (OpenWrt)
+	if command -v jsonfilter >/dev/null 2>&1; then
+		{
+			jsonfilter -i "$file" -e '@.rules[*].domain[*]' 2>/dev/null
+			jsonfilter -i "$file" -e '@.rules[*].domain_suffix[*]' 2>/dev/null
+			jsonfilter -i "$file" -e '@.rules[*].ip_cidr[*]' 2>/dev/null
+			jsonfilter -i "$file" -e '@.domain[*]' 2>/dev/null
+			jsonfilter -i "$file" -e '@.domains[*]' 2>/dev/null
+			jsonfilter -i "$file" -e '@.ip_cidr[*]' 2>/dev/null
+		} > "$tmp" 2>/dev/null
+	else
+		# Fallback: pull quoted tokens near known keys / any domain-like strings
+		# Extract strings after domain-related keys roughly via tr/sed
+		tr '{},[]' '\n' < "$file" 2>/dev/null | \
+			sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//' | \
+			grep -vE '^(domain|domain_suffix|domain_keyword|domain_regex|ip_cidr|rules|version|network|invert|true|false|[0-9]+)$' \
+			> "$tmp" 2>/dev/null || true
+	fi
+
+	local line t
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+		[ -z "$line" ] && continue
+		t=$(normalize_target "$line") || continue
+		if is_ipv4_or_cidr "$t" || is_domain_like "$t"; then
+			printf '%s\n' "$t"
+		fi
+	done < "$tmp"
+	rm -f "$tmp"
+}
+
+# Binary extractors (geosite.dat / geoip.dat / geosite.db / geoip.db / .srs)
+parse_list_binary() {
+	local file="$1"
+	local format="$2"
+	local category="$3"
+	local helper="route-profiles-geoextract"
+
+	if ! command -v "$helper" >/dev/null 2>&1; then
+		echo "Error: $helper not found (install route-profiles package fully)" >&2
+		return 1
+	fi
+	case "$format" in
+		geosite-dat|geoip-dat|geosite-db|geoip-db)
+			if [ -z "$category" ]; then
+				echo "Error: $format entry needs CATEGORY@url (e.g. geosite:openai@https://…/geosite.dat)" >&2
+				return 1
+			fi
+			"$helper" "$format" "$file" "$category"
+			;;
+		srs)
+			"$helper" srs "$file"
+			;;
+		*)
+			echo "Error: unknown binary format $format" >&2
+			return 1
+			;;
+	esac
+}
+
+parse_list_file() {
+	local file="$1"
+	local format="$2"
+	local category="${3:-}"
+	if [ "$format" = "auto" ]; then
+		format=$(list_detect_format "$file")
+	fi
+	case "$format" in
+		lst|list) parse_list_lst "$file" ;;
+		xray|v2ray) parse_list_xray "$file" ;;
+		singbox|sing-box|sb) parse_list_singbox "$file" ;;
+		geosite-dat|geoip-dat|geosite-db|geoip-db|srs)
+			parse_list_binary "$file" "$format" "$category"
+			;;
+		*) parse_list_lst "$file" ;;
+	esac
+}
+
+# Fetch and parse all list entries; print unique targets (domains/IPs)
+expand_remote_lists() {
+	local lists="$1"
+	local entry tag raw parsed
+	local tmpdir="/tmp/route-profiles-lists.$$"
+	local out="/tmp/route-profiles-lists-out.$$"
+
+	: > "$out"
+	[ -z "$lists" ] && { cat "$out"; rm -f "$out"; return 0; }
+
+	mkdir -p "$tmpdir"
+	printf '%s\n' "$lists" | while IFS= read -r entry; do
+		[ -z "$entry" ] && continue
+		list_split_entry "$entry"
+		tag=$(printf '%s' "$LIST_URL" | sed 's/[^a-zA-Z0-9._-]/_/g' | cut -c1-80)
+		raw="$tmpdir/$tag.raw"
+		parsed="$tmpdir/$tag.parsed"
+		if [ -n "$LIST_CATEGORY" ]; then
+			echo "Fetching list: $LIST_URL (format=$LIST_FORMAT category=$LIST_CATEGORY)" >&2
+		else
+			echo "Fetching list: $LIST_URL (format=$LIST_FORMAT)" >&2
+		fi
+		if list_fetch "$LIST_URL" "$raw"; then
+			parse_list_file "$raw" "$LIST_FORMAT" "$LIST_CATEGORY" | sort -u > "$parsed"
+			n=$(wc -l < "$parsed" 2>/dev/null | tr -d ' ')
+			echo "  -> $n targets from $LIST_URL" >&2
+			cat "$parsed" >> "$out"
+		else
+			echo "  Warning: failed to fetch $LIST_URL" >&2
+		fi
+	done
+
+	if [ -s "$out" ]; then
+		sort -u "$out"
+	fi
+	rm -rf "$tmpdir" "$out"
+}
+
+# Merge inline domains + remote lists into unique target list
+collect_targets() {
+	local inline="$1"
+	local lists="$2"
+	local tmp="/tmp/route-profiles-targets.$$"
+	: > "$tmp"
+	if [ -n "$inline" ]; then
+		printf '%s\n' "$inline" | while IFS= read -r d; do
+			t=$(normalize_target "$d") || continue
+			printf '%s\n' "$t"
+		done >> "$tmp"
+	fi
+	if [ -n "$lists" ]; then
+		expand_remote_lists "$lists" >> "$tmp"
+	fi
+	if [ -s "$tmp" ]; then
+		sort -u "$tmp"
+	fi
+	rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Routing teardown / setup
+# ---------------------------------------------------------------------------
+# Tear down legacy single-selective + all multi-selective slots
+selective_teardown() {
+	local i tid tname mark nftt
+
+	# Legacy v2.0 single selective
+	while ip rule del fwmark $AI_FWMARK_HEX lookup $AI_TABLE_ID 2>/dev/null; do :; done
+	while ip rule del fwmark $AI_FWMARK_HEX lookup $AI_TABLE_NAME 2>/dev/null; do :; done
+	ip route flush table $AI_TABLE_ID 2>/dev/null || true
+	nft destroy table $AI_NF_FAMILY $AI_NF_TABLE 2>/dev/null || true
+
+	i=0
+	while [ "$i" -lt "$SEL_SLOT_MAX" ]; do
+		tid=$(sel_slot_table_id "$i")
+		tname=$(sel_slot_table_name "$i")
+		mark=$(sel_slot_mark_hex "$i")
+		nftt=$(sel_slot_nft_table "$i")
+		while ip rule del fwmark "$mark" lookup "$tid" 2>/dev/null; do :; done
+		while ip rule del fwmark "$mark" lookup "$tname" 2>/dev/null; do :; done
+		ip route flush table "$tid" 2>/dev/null || true
+		nft destroy table $SEL_NF_FAMILY "$nftt" 2>/dev/null || true
+		i=$((i + 1))
+	done
+}
+
+geoip_teardown() {
+	while ip rule del fwmark $GEOIP_FWMARK_HEX lookup $GEOIP_TABLE_ID 2>/dev/null; do :; done
+	while ip rule del fwmark $GEOIP_FWMARK_HEX lookup $GEOIP_TABLE_NAME 2>/dev/null; do :; done
+	ip route flush table $GEOIP_TABLE_ID 2>/dev/null || true
+	nft destroy table $GEOIP_NF_FAMILY $GEOIP_NF_TABLE 2>/dev/null || true
+}
+
+teardown_all() {
+	selective_teardown
+	geoip_teardown
+	rm -f "$(cache_dir)/selective-slots" 2>/dev/null || true
+}
+
+clear_main_defaults() {
+	local line
+	# Delete all default routes in main table
+	ip route show table main 2>/dev/null | grep '^default' | while IFS= read -r line; do
+		# shellcheck disable=SC2086
+		ip route del $line 2>/dev/null || true
+	done
+}
+
+ensure_rt_table() {
+	local id="$1"
+	local name="$2"
+	grep -q "^$id $name" /etc/iproute2/rt_tables 2>/dev/null || \
+		echo "$id $name" >> /etc/iproute2/rt_tables
+}
+
+# selective_setup_slot <slot_index> <iface> [label]
+# Each enabled selective block gets its own routing table, fwmark, and nft set.
+selective_setup_slot() {
+	local slot="$1"
+	local iface="$2"
+	local label="${3:-sel$slot}"
+	local tid tname mark nftt prio
+
+	tid=$(sel_slot_table_id "$slot")
+	tname=$(sel_slot_table_name "$slot")
+	mark=$(sel_slot_mark_hex "$slot")
+	nftt=$(sel_slot_nft_table "$slot")
+	# Slightly different mangle priority per slot so rules don't collide
+	prio=$((100 + slot))
+
+	echo "Setting up selective[$label] via $iface (slot $slot, mark $mark, table $tid)..."
+	ensure_rt_table "$tid" "$tname"
+	ip route replace default dev "$iface" table "$tid" 2>/dev/null
+	while ip rule del fwmark "$mark" lookup "$tid" 2>/dev/null; do :; done
+	ip rule add fwmark "$mark" lookup "$tid" 2>/dev/null
+
+	nft add table $SEL_NF_FAMILY "$nftt" 2>/dev/null
+	nft add set $SEL_NF_FAMILY "$nftt" $SEL_NF_SET '{ type ipv4_addr ; flags interval,timeout ; }' 2>/dev/null
+	nft add chain $SEL_NF_FAMILY "$nftt" mangle_out "{ type route hook output priority mangle - $prio ; policy accept ; }" 2>/dev/null
+	nft add chain $SEL_NF_FAMILY "$nftt" mangle_pre "{ type filter hook prerouting priority mangle - $prio ; policy accept ; }" 2>/dev/null
+	nft flush chain $SEL_NF_FAMILY "$nftt" mangle_out 2>/dev/null
+	nft flush chain $SEL_NF_FAMILY "$nftt" mangle_pre 2>/dev/null
+	nft add rule $SEL_NF_FAMILY "$nftt" mangle_out ip daddr @$SEL_NF_SET meta mark set "$mark"
+	nft add rule $SEL_NF_FAMILY "$nftt" mangle_pre ip daddr @$SEL_NF_SET meta mark set "$mark"
+}
+
+# Back-compat wrapper (single iface → slot 0)
+selective_setup() {
+	selective_setup_slot 0 "$1" "default"
+}
+
+geoip_setup() {
+	local dev="$1"
+	local gw="$2"
+	echo "Setting up GeoIP route via WAN ($dev)..."
+	ensure_rt_table "$GEOIP_TABLE_ID" "$GEOIP_TABLE_NAME"
+	if [ -n "$gw" ]; then
+		ip route replace default via "$gw" dev "$dev" table $GEOIP_TABLE_ID 2>/dev/null || \
+			ip route replace default dev "$dev" table $GEOIP_TABLE_ID 2>/dev/null
+	else
+		ip route replace default dev "$dev" table $GEOIP_TABLE_ID 2>/dev/null
+	fi
+	while ip rule del fwmark $GEOIP_FWMARK_HEX lookup $GEOIP_TABLE_ID 2>/dev/null; do :; done
+	ip rule add fwmark $GEOIP_FWMARK_HEX lookup $GEOIP_TABLE_ID 2>/dev/null
+
+	nft add table $GEOIP_NF_FAMILY $GEOIP_NF_TABLE 2>/dev/null
+	nft add set $GEOIP_NF_FAMILY $GEOIP_NF_TABLE $GEOIP_NF_SET '{ type ipv4_addr ; flags interval ; }' 2>/dev/null
+	nft add set $GEOIP_NF_FAMILY $GEOIP_NF_TABLE $GEOIP_DOMAIN_SET '{ type ipv4_addr ; flags interval,timeout ; }' 2>/dev/null
+	nft add chain $GEOIP_NF_FAMILY $GEOIP_NF_TABLE mangle_out '{ type route hook output priority mangle - 90 ; policy accept ; }' 2>/dev/null
+	nft add chain $GEOIP_NF_FAMILY $GEOIP_NF_TABLE mangle_pre '{ type filter hook prerouting priority mangle - 90 ; policy accept ; }' 2>/dev/null
+	nft flush chain $GEOIP_NF_FAMILY $GEOIP_NF_TABLE mangle_out 2>/dev/null
+	nft flush chain $GEOIP_NF_FAMILY $GEOIP_NF_TABLE mangle_pre 2>/dev/null
+	nft add rule $GEOIP_NF_FAMILY $GEOIP_NF_TABLE mangle_out ip daddr @$GEOIP_NF_SET meta mark set $GEOIP_FWMARK_HEX
+	nft add rule $GEOIP_NF_FAMILY $GEOIP_NF_TABLE mangle_out ip daddr @$GEOIP_DOMAIN_SET meta mark set $GEOIP_FWMARK_HEX
+	nft add rule $GEOIP_NF_FAMILY $GEOIP_NF_TABLE mangle_pre ip daddr @$GEOIP_NF_SET meta mark set $GEOIP_FWMARK_HEX
+	nft add rule $GEOIP_NF_FAMILY $GEOIP_NF_TABLE mangle_pre ip daddr @$GEOIP_DOMAIN_SET meta mark set $GEOIP_FWMARK_HEX
+}
+
+# Populate nft set from newline-separated domains and/or IPv4/CIDRs
+sync_targets_to_set() {
+	local family="$1"
+	local table="$2"
+	local setname="$3"
+	local targets="$4"
+	local timeout="${5:-$DOMAIN_TIMEOUT}"
+	local target ips ip elem
+
+	nft list set "$family" "$table" "$setname" >/dev/null 2>&1 || {
+		echo "set $setname not found"
+		return 1
+	}
+
+	nft flush set "$family" "$table" "$setname" 2>/dev/null
+
+	if [ -z "$targets" ]; then
+		echo "Updated $setname: 0 targets"
+		return 0
+	fi
+
+	printf '%s\n' "$targets" | while IFS= read -r target; do
+		[ -z "$target" ] && continue
+		case "$target" in \#*) continue ;; esac
+
+		if is_ipv4_or_cidr "$target"; then
+			# CIDR/IP: no timeout when interval-only may apply; try with timeout first
+			if echo "$target" | grep -q '/'; then
+				nft add element "$family" "$table" "$setname" "{ $target }" 2>/dev/null || true
+			else
+				nft add element "$family" "$table" "$setname" "{ $target timeout ${timeout}s }" 2>/dev/null || \
+					nft add element "$family" "$table" "$setname" "{ $target }" 2>/dev/null || true
+			fi
+			continue
+		fi
+
+		ips=$(resolve_domain_ipv4 "$target")
+		for ip in $ips; do
+			echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || continue
+			nft add element "$family" "$table" "$setname" "{ $ip timeout ${timeout}s }" 2>/dev/null || true
+		done
+	done
+
+	local count
+	count=$(nft list set "$family" "$table" "$setname" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+	echo "Updated $setname: $count IPs/prefixes loaded"
+}
+
+# Back-compat alias
+sync_domains_to_set() {
+	sync_targets_to_set "$@"
+}
+
+geoip_load_prefixes() {
+	local source="$1"
+	local cache tag
+	local tmp_raw tmp_prefixes tmp_nft count
+
+	if [ -z "$source" ]; then
+		echo "Error: geoip source_url is empty" >&2
+		return 1
+	fi
+
+	cache=$(geoip_cache_file "$source")
+	tag=$(geoip_tmp_tag "$source")
+	tmp_raw="/tmp/route-geoip-${tag}.raw"
+	tmp_prefixes="/tmp/route-geoip-${tag}.zone"
+	tmp_nft="/tmp/route-geoip-${tag}.nft"
+
+	mkdir -p "$(cache_dir)"
+
+	if wget -q -O "$tmp_raw" "$source" 2>/dev/null; then
+		grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$tmp_raw" | sort -u > "$tmp_prefixes"
+		if [ -s "$tmp_prefixes" ]; then
+			{
+				echo "# GeoIP prefixes"
+				echo "# Source: $source"
+				echo "# Updated: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+				cat "$tmp_prefixes"
+			} > "$cache"
+		else
+			echo "Downloaded GeoIP data did not contain IPv4 prefixes"
+			rm -f "$tmp_raw" "$tmp_prefixes"
+			return 1
+		fi
+	elif [ -r "$cache" ]; then
+		echo "Download failed, using cached prefixes from $cache"
+		grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$cache" | sort -u > "$tmp_prefixes"
+	else
+		echo "Download failed and no cached prefixes found"
+		rm -f "$tmp_raw"
+		return 1
+	fi
+
+	count=$(grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' "$tmp_prefixes" 2>/dev/null || echo 0)
+	if [ -z "$count" ] || [ "$count" -eq 0 ]; then
+		echo "No GeoIP prefixes available"
+		rm -f "$tmp_raw" "$tmp_prefixes"
+		return 1
+	fi
+
+	{
+		echo "flush set $GEOIP_NF_FAMILY $GEOIP_NF_TABLE $GEOIP_NF_SET"
+		while IFS= read -r prefix; do
+			echo "add element $GEOIP_NF_FAMILY $GEOIP_NF_TABLE $GEOIP_NF_SET { $prefix }"
+		done < "$tmp_prefixes"
+	} > "$tmp_nft"
+
+	if nft -f "$tmp_nft"; then
+		echo "Updated $GEOIP_NF_SET: $count prefixes loaded from $source"
+		rm -f "$tmp_raw" "$tmp_prefixes" "$tmp_nft"
+		return 0
+	fi
+	echo "Failed to load GeoIP prefixes into nftables"
+	rm -f "$tmp_raw" "$tmp_prefixes" "$tmp_nft"
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# Network interface resolve / bring-up
+# OpenWrt UCI names (e.g. awg_warp) may not have a kernel netdev until ifup.
+# ---------------------------------------------------------------------------
+uci_net_exists() {
+	local name="$1"
+	[ -n "$name" ] || return 1
+	uci -q get "network.$name" >/dev/null 2>&1 || return 1
+	# section type should be interface
+	local t
+	t=$(uci -q get "network.$name" 2>/dev/null)
+	# uci get on section returns type name for anonymous? for named: empty or value
+	# Better: check proto or that it's in network
+	uci -q show "network.$name" 2>/dev/null | grep -q . || return 1
+	return 0
+}
+
+iface_l3_device() {
+	local name="$1"
+	if command -v jsonfilter >/dev/null 2>&1 && command -v ifstatus >/dev/null 2>&1; then
+		ifstatus "$name" 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null
+	fi
+}
+
+iface_is_up() {
+	local name="$1"
+	if command -v jsonfilter >/dev/null 2>&1 && command -v ifstatus >/dev/null 2>&1; then
+		[ "$(ifstatus "$name" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)" = "true" ]
+		return $?
+	fi
+	ip link show "$name" >/dev/null 2>&1
+}
+
+# Bring up OpenWrt logical iface if needed; print resolved kernel device name
+# Usage: dev=$(ensure_net_device awg_warp) || return 1
+ensure_net_device() {
+	local name="$1"
+	local wait_s="${2:-20}"
+	local dev i up l3
+
+	[ -n "$name" ] || return 1
+
+	# Already a live kernel device?
+	if ip link show "$name" >/dev/null 2>&1; then
+		printf '%s' "$name"
+		return 0
+	fi
+
+	# UCI logical interface (AmneziaWG/WireGuard often down until ifup)
+	if uci_net_exists "$name"; then
+		if ! iface_is_up "$name"; then
+			echo "Bringing up network interface $name..." >&2
+			ifup "$name" 2>/dev/null || true
+		fi
+		i=0
+		while [ "$i" -lt "$wait_s" ]; do
+			l3=$(iface_l3_device "$name")
+			if [ -n "$l3" ] && ip link show "$l3" >/dev/null 2>&1; then
+				printf '%s' "$l3"
+				return 0
+			fi
+			# Some protos use same name once up
+			if ip link show "$name" >/dev/null 2>&1; then
+				printf '%s' "$name"
+				return 0
+			fi
+			sleep 1
+			i=$((i + 1))
+		done
+		echo "Error: network interface '$name' did not come up within ${wait_s}s" >&2
+		ifstatus "$name" 2>/dev/null | head -c 400 >&2 || true
+		echo >&2
+		return 1
+	fi
+
+	echo "Error: '$name' is neither a kernel device nor an OpenWrt network interface" >&2
+	echo "Kernel devices:" >&2
+	ip -o link show 2>/dev/null | awk -F': ' '{print "  " $2}' >&2 || true
+	echo "UCI network interfaces (sample):" >&2
+	uci show network 2>/dev/null | grep '=interface$' | sed 's/^network\./  /;s/=interface$//' | head -n 30 >&2 || true
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# Apply profile
+# ---------------------------------------------------------------------------
+cmd_apply() {
+	local target="$1"
+	local file id
+	local dev gw sel_dev
+	local slot line idx label sdev
+	local sel_tmp="/tmp/route-profiles-apply-sel.$$"
+	local any_sel=0
+
+	if [ -z "$target" ]; then
+		echo "Usage: route-profiles apply <id|path>" >&2
+		return 1
+	fi
+
+	if [ -f "$target" ]; then
+		file="$target"
+		id=$(basename "$target" .toml)
+	else
+		id="$target"
+		file=$(profile_path "$id")
+	fi
+
+	if [ ! -r "$file" ]; then
+		echo "Error: profile not found: $file" >&2
+		return 1
+	fi
+
+	profile_parse "$file" || return 1
+	profile_validate || return 1
+
+	echo "Applying profile: ${P_NAME:-$id} ($file)"
+
+	# Tear down previous policy hooks
+	teardown_all
+
+	# Default route
+	clear_main_defaults
+	case "$P_ROUTE_TYPE" in
+		direct)
+			dev="${P_ROUTE_DEVICE:-$(wan_dev)}"
+			gw="${P_ROUTE_GATEWAY:-$(wan_gw)}"
+			if [ -z "$gw" ]; then
+				echo "Error: no WAN gateway (set route-profiles.settings.wan_gw or fix WAN DHCP)" >&2
+				return 1
+			fi
+			echo "Default route: direct via $gw dev $dev"
+			ip route add default via "$gw" dev "$dev" 2>/dev/null || \
+				ip route replace default via "$gw" dev "$dev" 2>/dev/null || {
+					echo "Warning: failed to set direct default route" >&2
+				}
+			;;
+		interface)
+			if [ -z "$P_ROUTE_DEVICE" ]; then
+				echo "Error: profile $id has empty route.device" >&2
+				return 1
+			fi
+			dev=$(ensure_net_device "$P_ROUTE_DEVICE") || {
+				# restore direct as safety
+				gw=$(wan_gw)
+				[ -n "$gw" ] && ip route add default via "$gw" dev "$(wan_dev)" 2>/dev/null || true
+				return 1
+			}
+			if [ "$dev" != "$P_ROUTE_DEVICE" ]; then
+				echo "Default route: interface $P_ROUTE_DEVICE (device $dev)"
+			else
+				echo "Default route: interface $dev"
+			fi
+			ip route add default dev "$dev" 2>/dev/null || \
+				ip route replace default dev "$dev" 2>/dev/null || {
+					echo "Error: failed to set default route via $dev" >&2
+					return 1
+				}
+			;;
+	esac
+
+	# Selective: one slot per enabled block; IPs filled in background
+	slot=0
+	mkdir -p "$(cache_dir)"
+	rm -f "$(cache_dir)/selective-slots"
+	_sel_enabled_entries > "$sel_tmp"
+	if [ -s "$sel_tmp" ]; then
+		while IFS='|' read -r idx label sdev || [ -n "$idx" ]; do
+			[ -z "$idx" ] && continue
+			[ -z "$sdev" ] && sdev="${P_ROUTE_DEVICE}"
+			sel_dev=$(ensure_net_device "$sdev" 12) || {
+				echo "Warning: selective[$label] device '$sdev' unavailable; skipping" >&2
+				continue
+			}
+			if [ "$slot" -ge "$SEL_SLOT_MAX" ]; then
+				echo "Warning: selective slot limit ($SEL_SLOT_MAX) reached; skipping $label" >&2
+				break
+			fi
+			selective_setup_slot "$slot" "$sel_dev" "$label"
+			# Map runtime slot → profile block index (for update)
+			echo "$slot $idx $label $sel_dev" >> "$(cache_dir)/selective-slots"
+			echo "Selective[$label]: ACTIVE via $sel_dev (slot $slot, IPs loading in background)"
+			any_sel=1
+			slot=$((slot + 1))
+		done < "$sel_tmp"
+	fi
+	rm -f "$sel_tmp"
+	if [ "$any_sel" -eq 0 ]; then
+		rm -f "$(cache_dir)/selective-slots" 2>/dev/null || true
+		echo "Selective routing: off"
+	fi
+
+	# GeoIP: tables now; prefixes/domains in background
+	if [ "$P_GEO_ENABLED" = "true" ]; then
+		geoip_setup "$(wan_dev)" "$(wan_gw)"
+		echo "GeoIP routing: ACTIVE (prefixes/domains loading in background)"
+	else
+		echo "GeoIP routing: off"
+	fi
+
+	# Persist active only when applying a managed profile id
+	if [ -f "$(profile_path "$id")" ] || [ "$file" = "$(profile_path "$id")" ]; then
+		set_active "$id"
+	elif [ -f "$target" ]; then
+		# imported path outside dir: still set active to id if we can map
+		set_active "$id"
+	fi
+
+	# Slow work (DNS + GeoIP download) must not block LuCI XHR
+	if [ "$P_SEL_ANY" = "true" ] || [ "$P_GEO_ENABLED" = "true" ]; then
+		cmd_update_async
+	fi
+
+	echo "-> active profile: $(active_id)"
+	cmd_status
+}
+
+# ---------------------------------------------------------------------------
+# Update (refresh sets for active profile)
+# ---------------------------------------------------------------------------
+cmd_update() {
+	local id file sel_targets geo_targets
+	local slot pidx label sdev nftt domains lists
+	local slots_file missing=0
+	local line
+
+	id=$(active_id)
+	file=$(profile_path "$id")
+
+	if [ ! -r "$file" ]; then
+		echo "Active profile $id not found"
+		return 1
+	fi
+
+	profile_parse "$file" || return 1
+
+	if [ "$P_SEL_ANY" != "true" ] && [ "$P_GEO_ENABLED" != "true" ]; then
+		echo "Active profile has selective and geoip disabled; nothing to update"
+		return 0
+	fi
+
+	if [ "$P_SEL_ANY" = "true" ]; then
+		slots_file="$(cache_dir)/selective-slots"
+		mkdir -p "$(cache_dir)"
+		# Rebuild slot map if missing (e.g. reboot before apply wrote it — use live slots)
+		if [ ! -s "$slots_file" ]; then
+			slot=0
+			_sel_enabled_entries | while IFS='|' read -r pidx label sdev; do
+				[ -z "$pidx" ] && continue
+				echo "$slot $pidx $label ${sdev:-unknown}"
+				slot=$((slot + 1))
+			done > "$slots_file"
+		fi
+
+		missing=0
+		while read -r slot pidx label sdev || [ -n "$slot" ]; do
+			[ -z "$slot" ] && continue
+			nftt=$(sel_slot_nft_table "$slot")
+			if ! nft list set $SEL_NF_FAMILY "$nftt" $SEL_NF_SET >/dev/null 2>&1; then
+				# Legacy single table (older apply)
+				if [ "$slot" = "0" ] && nft list set $AI_NF_FAMILY $AI_NF_TABLE $AI_NF_SET >/dev/null 2>&1; then
+					nftt=""
+				else
+					missing=1
+					break
+				fi
+			fi
+		done < "$slots_file"
+
+		if [ "$missing" -eq 1 ]; then
+			echo "Selective sets missing; re-applying profile..."
+			cmd_apply "$id"
+			return $?
+		fi
+
+		while read -r slot pidx label sdev || [ -n "$slot" ]; do
+			[ -z "$slot" ] && continue
+			domains=$(_sel_blob_field "$pidx" "DOM")
+			lists=$(_sel_blob_field "$pidx" "LST")
+			sel_targets=$(collect_targets "$domains" "$lists")
+			nftt=$(sel_slot_nft_table "$slot")
+			if nft list set $SEL_NF_FAMILY "$nftt" $SEL_NF_SET >/dev/null 2>&1; then
+				echo "Refreshing selective[$label] domain IPs (slot $slot)..."
+				sync_targets_to_set "$SEL_NF_FAMILY" "$nftt" "$SEL_NF_SET" "$sel_targets" || true
+			elif [ "$slot" = "0" ] && nft list set $AI_NF_FAMILY $AI_NF_TABLE $AI_NF_SET >/dev/null 2>&1; then
+				echo "Refreshing selective domain IPs (legacy table)..."
+				sync_targets_to_set "$AI_NF_FAMILY" "$AI_NF_TABLE" "$AI_NF_SET" "$sel_targets" || true
+			fi
+		done < "$slots_file"
+	fi
+
+	if [ "$P_GEO_ENABLED" = "true" ]; then
+		if nft list set $GEOIP_NF_FAMILY $GEOIP_NF_TABLE $GEOIP_NF_SET >/dev/null 2>&1; then
+			echo "Refreshing GeoIP prefixes and domains..."
+			geoip_load_prefixes "${P_GEO_SOURCE}" || true
+			geo_targets=$(collect_targets "$P_GEO_DOMAINS" "$P_GEO_LISTS")
+			sync_targets_to_set "$GEOIP_NF_FAMILY" "$GEOIP_NF_TABLE" "$GEOIP_DOMAIN_SET" "$geo_targets" "86400" || true
+		else
+			echo "GeoIP sets missing; re-applying profile..."
+			cmd_apply "$id"
+			return $?
+		fi
+	fi
+	echo "Update finished."
+}
+
+cmd_update_async() {
+	local log="/tmp/route-profiles-update.log"
+	# Avoid stacking many refresh jobs
+	if [ -f /tmp/route-profiles-update.pid ]; then
+		old=$(cat /tmp/route-profiles-update.pid 2>/dev/null)
+		if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+			echo "Domain/GeoIP refresh already running (pid $old, log $log)"
+			return 0
+		fi
+	fi
+	(
+		echo "=== update start $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date) ==="
+		/usr/bin/route-profiles update
+		echo "=== update end $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date) ==="
+	) > "$log" 2>&1 &
+	echo $! > /tmp/route-profiles-update.pid
+	echo "Domain/GeoIP refresh started in background (pid $!, log $log)"
+}
+
+# ---------------------------------------------------------------------------
+# Status / list / show
+# ---------------------------------------------------------------------------
+live_default_dev() {
+	ip route show table main 2>/dev/null | grep '^default' | head -n1 | \
+		sed -n 's/.* dev \([^ ]*\).*/\1/p'
+}
+
+selective_active() {
+	local i mark tid tname
+	# Legacy
+	if ip rule show 2>/dev/null | grep -Eq "fwmark $AI_FWMARK_HEX lookup ($AI_TABLE_NAME|$AI_TABLE_ID)"; then
+		return 0
+	fi
+	i=0
+	while [ "$i" -lt "$SEL_SLOT_MAX" ]; do
+		mark=$(sel_slot_mark_hex "$i")
+		tid=$(sel_slot_table_id "$i")
+		tname=$(sel_slot_table_name "$i")
+		if ip rule show 2>/dev/null | grep -Eq "fwmark $mark lookup ($tname|$tid)"; then
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+geoip_active() {
+	ip rule show 2>/dev/null | grep -Eq "fwmark $GEOIP_FWMARK_HEX lookup ($GEOIP_TABLE_NAME|$GEOIP_TABLE_ID)"
+}
+
+cmd_status() {
+	local id file def
+	local i mark tid tname nftt count any_live
+	local line pidx label en dev
+	id=$(active_id)
+	file=$(profile_path "$id")
+	def=$(live_default_dev)
+
+	echo "Active profile: $id"
+	if [ -r "$file" ]; then
+		# meta-only: skip domain arrays (keeps LuCI load fast)
+		profile_parse "$file" meta 2>/dev/null || true
+		[ -n "$P_NAME" ] && echo "  Name: $P_NAME"
+		[ -n "$P_DESCRIPTION" ] && echo "  Description: $P_DESCRIPTION"
+		echo "  route.type: ${P_ROUTE_TYPE:-?}"
+		[ -n "$P_ROUTE_DEVICE" ] && echo "  route.device: $P_ROUTE_DEVICE"
+		if [ "${P_SEL_COUNT:-0}" -gt 0 ]; then
+			echo "  selective.blocks: $P_SEL_COUNT (any enabled: ${P_SEL_ANY:-false})"
+			printf '%s\n' "$P_SEL_BLOB" | while IFS= read -r line; do
+				case "$line" in
+					SEL\ *)
+						set -- $line
+						# SEL idx label enabled device
+						printf '    - %s: enabled=%s device=%s\n' "$3" "${4:-false}" "${5:--}"
+						;;
+				esac
+			done
+		else
+			echo "  selective.enabled: ${P_SEL_ENABLED:-false}"
+		fi
+		echo "  geoip.enabled: ${P_GEO_ENABLED:-false}"
+	else
+		echo "  (profile file missing: $file)"
+	fi
+	echo ""
+	echo "Live default route device: ${def:-none}"
+	ip route show table main 2>/dev/null | grep '^default' || echo "(no default route)"
+	echo ""
+	any_live=0
+	# Legacy single table
+	if ip rule show 2>/dev/null | grep -Eq "fwmark $AI_FWMARK_HEX lookup ($AI_TABLE_NAME|$AI_TABLE_ID)"; then
+		count=$(nft list set $AI_NF_FAMILY $AI_NF_TABLE $AI_NF_SET 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null)
+		count=${count:-0}
+		echo "Selective routing: ACTIVE legacy (fwmark $AI_FWMARK_HEX, $count IPs)"
+		any_live=1
+	fi
+	i=0
+	while [ "$i" -lt "$SEL_SLOT_MAX" ]; do
+		mark=$(sel_slot_mark_hex "$i")
+		tid=$(sel_slot_table_id "$i")
+		tname=$(sel_slot_table_name "$i")
+		nftt=$(sel_slot_nft_table "$i")
+		if ip rule show 2>/dev/null | grep -Eq "fwmark $mark lookup ($tname|$tid)"; then
+			count=$(nft list set $SEL_NF_FAMILY "$nftt" $SEL_NF_SET 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null)
+			count=${count:-0}
+			label="slot$i"
+			if [ -r "$(cache_dir)/selective-slots" ]; then
+				line=$(awk -v s="$i" '$1==s {print $3; exit}' "$(cache_dir)/selective-slots" 2>/dev/null)
+				[ -n "$line" ] && label="$line"
+			fi
+			dev=$(ip route show table "$tid" 2>/dev/null | awk '/default/ {for(j=1;j<=NF;j++) if($j=="dev"){print $(j+1); exit}}')
+			echo "Selective[$label]: ACTIVE via ${dev:-?} (fwmark $mark, table $tid, $count IPs)"
+			any_live=1
+		fi
+		i=$((i + 1))
+	done
+	if [ "$any_live" -eq 0 ]; then
+		echo "Selective routing: INACTIVE"
+	fi
+	if geoip_active; then
+		local pcount dcount
+		pcount=$(nft list set $GEOIP_NF_FAMILY $GEOIP_NF_TABLE $GEOIP_NF_SET 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null)
+		dcount=$(nft list set $GEOIP_NF_FAMILY $GEOIP_NF_TABLE $GEOIP_DOMAIN_SET 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null)
+		pcount=${pcount:-0}
+		dcount=${dcount:-0}
+		echo "GeoIP routing: ACTIVE (fwmark $GEOIP_FWMARK_HEX, $pcount prefixes, $dcount domain IPs)"
+	else
+		echo "GeoIP routing: INACTIVE"
+	fi
+}
+
+cmd_list() {
+	local dir id active mark file name
+	dir=$(profiles_dir)
+	active=$(active_id)
+	mkdir -p "$dir"
+
+	echo "Profiles in $dir:"
+	for file in "$dir"/*.toml; do
+		[ -f "$file" ] || continue
+		id=$(basename "$file" .toml)
+		# skip examples from UI list
+		case "$id" in
+			*.example|*.example.*) continue ;;
+		esac
+		case "$file" in
+			*.example.toml) continue ;;
+		esac
+		mark="-"
+		[ "$id" = "$active" ] && mark="*"
+		name=$(profile_name_quick "$file")
+		# machine-friendly: mark|id|name
+		printf '%s|%s|%s\n' "$mark" "$id" "$name"
+	done
+}
+
+cmd_show() {
+	local id="$1"
+	local file
+	if [ -z "$id" ]; then
+		echo "Usage: route-profiles show <id>" >&2
+		return 1
+	fi
+	if [ -f "$id" ]; then
+		file="$id"
+	else
+		file=$(profile_path "$id")
+	fi
+	if [ ! -r "$file" ]; then
+		echo "Profile not found: $file" >&2
+		return 1
+	fi
+	cat "$file"
+}
+
+# ---------------------------------------------------------------------------
+# Import / delete
+# ---------------------------------------------------------------------------
+cmd_import() {
+	local src="$1"
+	local id="$2"
+	local dest dir
+
+	if [ -z "$src" ] || [ ! -r "$src" ]; then
+		echo "Usage: route-profiles import <path> [id]" >&2
+		echo "Error: source not readable: $src" >&2
+		return 1
+	fi
+
+	# validate parse
+	profile_parse "$src" || return 1
+	profile_validate || return 1
+
+	if [ -z "$id" ]; then
+		id=$(basename "$src" .toml)
+		# sanitize
+		id=$(printf '%s' "$id" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9._-]/-/g')
+	fi
+
+	if [ "$id" = "direct" ]; then
+		echo "Error: cannot overwrite built-in profile 'direct'" >&2
+		return 1
+	fi
+
+	dir=$(profiles_dir)
+	mkdir -p "$dir"
+	dest=$(profile_path "$id")
+	cp "$src" "$dest"
+	echo "Imported profile: $id -> $dest"
+}
+
+cmd_delete() {
+	local id="$1"
+	local file
+
+	if [ -z "$id" ]; then
+		echo "Usage: route-profiles delete <id>" >&2
+		return 1
+	fi
+	if [ "$id" = "direct" ]; then
+		echo "Error: cannot delete built-in profile 'direct'" >&2
+		return 1
+	fi
+	if [ "$id" = "$(active_id)" ]; then
+		echo "Error: cannot delete active profile; apply another first" >&2
+		return 1
+	fi
+	file=$(profile_path "$id")
+	if [ ! -f "$file" ]; then
+		echo "Profile not found: $id" >&2
+		return 1
+	fi
+	rm -f "$file"
+	echo "Deleted profile: $id"
+}
+
+# ---------------------------------------------------------------------------
+# Legacy detection helpers
+# ---------------------------------------------------------------------------
+legacy_selective_active() {
+	nft list table $AI_NF_FAMILY $AI_NF_TABLE >/dev/null 2>&1 || selective_active
+}
+
+legacy_geoip_active() {
+	nft list table $GEOIP_NF_FAMILY $GEOIP_NF_TABLE >/dev/null 2>&1 || geoip_active
+}
+
+detect_legacy_route() {
+	# returns: type|device  e.g. direct|wan  or interface|awg_brr
+	local def awg wgi warp enwarp wdev
+	def=$(live_default_dev)
+	# Prefer former vpn-switch UCI when detecting 1.x state
+	wdev=$(uci -q get vpn-switch.settings.wan_dev 2>/dev/null \
+		|| uci -q get route-profiles.settings.wan_dev 2>/dev/null || echo "wan")
+	awg=$(uci -q get vpn-switch.settings.awg_brr 2>/dev/null \
+		|| uci -q get route-profiles.settings.awg_brr 2>/dev/null || echo "awg_brr")
+	wgi=$(uci -q get vpn-switch.settings.wgi 2>/dev/null \
+		|| uci -q get route-profiles.settings.wgi 2>/dev/null || echo "wgi")
+	warp=$(uci -q get vpn-switch.settings.awg_warp 2>/dev/null \
+		|| uci -q get route-profiles.settings.awg_warp 2>/dev/null || echo "awg_warp")
+	enwarp=$(uci -q get vpn-switch.settings.awg_enwarp 2>/dev/null \
+		|| uci -q get route-profiles.settings.awg_enwarp 2>/dev/null || echo "awg_enwarp")
+
+	if [ -z "$def" ] || [ "$def" = "$wdev" ]; then
+		echo "direct|$wdev"
+		return
+	fi
+	case "$def" in
+		"$awg"|"$wgi"|"$warp"|"$enwarp")
+			echo "interface|$def"
+			return
+			;;
+	esac
+	# unknown device — treat as interface if not wan
+	if [ "$def" != "$wdev" ]; then
+		echo "interface|$def"
+	else
+		echo "direct|$wdev"
+	fi
+}
+
+# Write a simple interface-only profile for a migrated VPN slot
+migrate_write_slot() {
+	local id="$1"
+	local dev="$2"
+	local name="$3"
+	local force="${4:-0}"
+	local path
+
+	[ -z "$dev" ] && return 0
+	[ "$id" = "direct" ] && return 0
+	path=$(profile_path "$id")
+	if [ -f "$path" ] && [ "$force" -eq 0 ]; then
+		echo "Keeping existing $id.toml"
+		return 0
+	fi
+	W_NAME="$name"
+	W_DESC="Migrated from 1.x settings ($dev)"
+	W_RTYPE="interface"
+	W_RDEV="$dev"
+	W_RGW=""
+	W_SEL_EN="false"
+	W_SEL_DEV=""
+	W_SEL_DOMAINS=""
+	W_SEL_LISTS=""
+	W_GEO_EN="false"
+	W_GEO_SOURCE=""
+	W_GEO_DOMAINS=""
+	W_GEO_LISTS=""
+	write_profile "$path"
+	echo "Saved: $path"
+}
+
+# ---------------------------------------------------------------------------
+# migrate-legacy
+# ---------------------------------------------------------------------------
+cmd_migrate_legacy() {
+	local force=0
+	local migrated dir backup_ts backup_dir
+	local rtype rdev
+	local sel_en=false sel_dev="" sel_domains=""
+	local geo_en=false geo_source="" geo_domains=""
+	local snap slot_dev slot_id
+	local old_ai old_geo old_prefix
+	# Former package name (vpn-switch) — still scanned for 1.x artifacts
+	local legacy_pkg="vpn-switch"
+	local legacy_root="/etc/vpn-switch"
+
+	[ "$1" = "--force" ] && force=1
+
+	migrated=$(uci_get "settings.migrated_v2" "0")
+	if [ "$migrated" = "1" ] && [ "$force" -eq 0 ]; then
+		echo "Already migrated to v2 (use --force to re-run)"
+		return 0
+	fi
+
+	dir=$(profiles_dir)
+	mkdir -p "$dir" "$(cache_dir)"
+	backup_ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d%H%M%S')
+	backup_dir="/etc/route-profiles/backup/$backup_ts"
+	mkdir -p "$backup_dir"
+
+	echo "=== Migrating legacy routing setup (vpn-switch → route-profiles) ==="
+
+	# Prefer old package UCI, then current package, then defaults
+	local wdev wgw
+	wdev=$(uci -q get "${legacy_pkg}.settings.wan_dev" 2>/dev/null \
+		|| uci -q get route-profiles.settings.wan_dev 2>/dev/null \
+		|| echo "wan")
+	wgw=$(uci -q get "${legacy_pkg}.settings.wan_gw" 2>/dev/null \
+		|| uci -q get route-profiles.settings.wan_gw 2>/dev/null \
+		|| echo "")
+
+	# Copy any existing TOML profiles from old package tree
+	if [ -d "${legacy_root}/profiles" ]; then
+		for f in "${legacy_root}/profiles"/*.toml; do
+			[ -f "$f" ] || continue
+			base=$(basename "$f")
+			if [ ! -f "$dir/$base" ] || [ "$force" -eq 1 ]; then
+				cp "$f" "$dir/$base" 2>/dev/null || true
+				echo "Imported profile: $base"
+			fi
+		done
+	fi
+
+	# Detect live route
+	rtype=$(detect_legacy_route | cut -d'|' -f1)
+	rdev=$(detect_legacy_route | cut -d'|' -f2)
+
+	# Selective (1.x files under old package path)
+	old_ai="${legacy_root}/ai-domains"
+	sel_dev=$(uci -q get "${legacy_pkg}.ai_route.interface" 2>/dev/null || echo "")
+	if legacy_selective_active; then
+		sel_en=true
+		[ -z "$sel_dev" ] && sel_dev="${rdev}"
+	fi
+	if [ -r "$old_ai" ]; then
+		sel_domains=$(domains_from_file "$old_ai")
+		cp "$old_ai" "$backup_dir/ai-domains" 2>/dev/null || true
+	fi
+	[ -z "$sel_dev" ] && sel_dev=$(uci -q get "${legacy_pkg}.ai_route.interface" 2>/dev/null || echo "awg_brr")
+
+	# GeoIP
+	old_geo="${legacy_root}/geoip-domains"
+	old_prefix=$(uci -q get "${legacy_pkg}.geoip.prefixes_file" 2>/dev/null || echo "${legacy_root}/geoip-ru.zone")
+	geo_source=$(uci -q get "${legacy_pkg}.geoip.source_url" 2>/dev/null || \
+		echo "https://www.ipdeny.com/ipblocks/data/countries/ru.zone")
+	if legacy_geoip_active; then
+		geo_en=true
+	fi
+	if [ -r "$old_geo" ]; then
+		geo_domains=$(domains_from_file "$old_geo")
+		cp "$old_geo" "$backup_dir/geoip-domains" 2>/dev/null || true
+	fi
+	if [ -r "$old_prefix" ]; then
+		cp "$old_prefix" "$(geoip_cache_file "$geo_source")" 2>/dev/null || true
+		cp "$old_prefix" "$backup_dir/$(basename "$old_prefix")" 2>/dev/null || true
+	fi
+
+	# Write legacy-snapshot only if 1.x artifacts exist
+	snap=$(profile_path "legacy-snapshot")
+	has_legacy=0
+	[ -r "$old_ai" ] && has_legacy=1
+	[ -r "$old_geo" ] && has_legacy=1
+	uci -q get "${legacy_pkg}.ai_route.interface" >/dev/null 2>&1 && has_legacy=1
+	uci -q get "${legacy_pkg}.geoip.source_url" >/dev/null 2>&1 && has_legacy=1
+	uci -q get "${legacy_pkg}.geoip.country" >/dev/null 2>&1 && has_legacy=1
+	uci -q get "${legacy_pkg}.settings.awg_brr" >/dev/null 2>&1 && has_legacy=1
+	[ "$sel_en" = "true" ] && has_legacy=1
+	[ "$geo_en" = "true" ] && has_legacy=1
+	[ "$rtype" = "interface" ] && has_legacy=1
+
+	if [ -f "$snap" ] && [ "$force" -eq 0 ] && [ "$migrated" = "1" ]; then
+		echo "Keeping existing legacy-snapshot.toml"
+	elif [ "$has_legacy" -eq 1 ] || [ "$force" -eq 1 ]; then
+		W_NAME="Legacy snapshot"
+		W_DESC="Auto-migrated from vpn-switch at $backup_ts"
+		W_RTYPE="$rtype"
+		W_RDEV="$rdev"
+		W_RGW="$wgw"
+		W_SEL_EN="$sel_en"
+		W_SEL_DEV="$sel_dev"
+		W_SEL_DOMAINS="$sel_domains"
+		W_SEL_LISTS=""
+		W_GEO_EN="$geo_en"
+		W_GEO_SOURCE="$geo_source"
+		W_GEO_DOMAINS="$geo_domains"
+		W_GEO_LISTS=""
+		write_profile "$snap"
+		echo "Saved: $snap"
+	else
+		echo "No 1.x artifacts found; skipping legacy-snapshot"
+	fi
+
+	# Per-slot simple profiles only when 1.x UCI defined them
+	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_brr" 2>/dev/null || true)
+	[ -n "$slot_dev" ] && migrate_write_slot "brr" "$slot_dev" "BRR" "$force"
+	slot_dev=$(uci -q get "${legacy_pkg}.settings.wgi" 2>/dev/null || true)
+	[ -n "$slot_dev" ] && migrate_write_slot "wgi" "$slot_dev" "WGI" "$force"
+	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_warp" 2>/dev/null || true)
+	[ -n "$slot_dev" ] && migrate_write_slot "awg-warp" "$slot_dev" "AWG WARP" "$force"
+	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_enwarp" 2>/dev/null || true)
+	[ -n "$slot_dev" ] && migrate_write_slot "awg-enwarp" "$slot_dev" "AWG ENWARP" "$force"
+
+	# Ensure direct.toml exists
+	if [ ! -f "$(profile_path direct)" ]; then
+		W_NAME="DIRECT"
+		W_DESC="Direct WAN, no VPN"
+		W_RTYPE="direct"
+		W_RDEV="$wdev"
+		W_RGW="$wgw"
+		W_SEL_EN="false"
+		W_SEL_DEV=""
+		W_SEL_DOMAINS=""
+		W_SEL_LISTS=""
+		W_GEO_EN="false"
+		W_GEO_SOURCE=""
+		W_GEO_DOMAINS=""
+		W_GEO_LISTS=""
+		write_profile "$(profile_path direct)"
+	fi
+
+	echo "=== Cleaning legacy runtime state ==="
+	teardown_all
+
+	# ifdown warp-like ifaces if present
+	for d in \
+		"$(uci -q get "${legacy_pkg}.settings.awg_warp" 2>/dev/null || echo awg_warp)" \
+		"$(uci -q get "${legacy_pkg}.settings.awg_enwarp" 2>/dev/null || echo awg_enwarp)"
+	do
+		if ip link show "$d" >/dev/null 2>&1; then
+			ifdown "$d" 2>/dev/null || true
+		fi
+	done
+
+	# Backup + remove old domain files
+	[ -f "$old_ai" ] && rm -f "$old_ai"
+	[ -f "$old_geo" ] && rm -f "$old_geo"
+	[ -f "$old_prefix" ] && [ "$old_prefix" != "$(geoip_cache_file "$geo_source")" ] && rm -f "$old_prefix"
+
+	# Drop old package UCI + 1.x sections
+	uci -q delete "${legacy_pkg}.ai_route" 2>/dev/null || true
+	uci -q delete "${legacy_pkg}.geoip" 2>/dev/null || true
+	uci -q delete "${legacy_pkg}" 2>/dev/null || true
+	uci -q commit "${legacy_pkg}" 2>/dev/null || true
+	# luci leftover
+	uci -q delete luci.ai_route 2>/dev/null || true
+	uci -q commit luci 2>/dev/null || true
+
+	# Ensure settings section on new package
+	uci -q set route-profiles.settings=route-profiles 2>/dev/null || \
+		uci set route-profiles.settings=route-profiles
+	uci_set "settings.active" "direct"
+	uci_set "settings.profiles_dir" "$dir"
+	uci_set "settings.wan_dev" "$wdev"
+	uci_set "settings.wan_gw" "$wgw"
+	uci_set "settings.migrated_v2" "1"
+	uci_commit_vs
+
+	# Remove leftover helper scripts (package no longer ships them)
+	rm -f /usr/bin/vpn-ai-update /usr/bin/vpn-geoip-update /usr/bin/vpn-switch 2>/dev/null || true
+
+	echo "=== Applying DIRECT profile ==="
+	cmd_apply "direct"
+
+	echo "=== Migration complete ==="
+	echo "Previous setup saved as: legacy-snapshot"
+	echo "VPN slot profiles (if any): brr, wgi, awg-warp, awg-enwarp"
+	echo "Backups under: $backup_dir"
+	echo "Router is on DIRECT. Re-apply with: route-profiles apply legacy-snapshot"
+}
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+cmd_help() {
+	cat <<'EOF'
+route-profiles — TOML profile-driven routing for OpenWrt
+
+Usage:
+  route-profiles status
+  route-profiles list
+  route-profiles show <id>
+  route-profiles apply <id|path>
+  route-profiles import <path> [id]
+  route-profiles delete <id>
+  route-profiles update
+  route-profiles update-async
+  route-profiles migrate-legacy [--force]
+  route-profiles teardown
+  route-profiles help
+
+Profiles live in /etc/route-profiles/profiles/<id>.toml
+Default active profile: direct
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+case "${1:-status}" in
+	status) cmd_status ;;
+	list) cmd_list ;;
+	show) cmd_show "$2" ;;
+	apply) cmd_apply "$2" ;;
+	import) cmd_import "$2" "$3" ;;
+	delete) cmd_delete "$2" ;;
+	update) cmd_update ;;
+	update-async) cmd_update_async ;;
+	migrate-legacy) shift; cmd_migrate_legacy "$@" ;;
+	teardown)
+		teardown_all
+		echo "Teardown complete (nft/ip rules for selective+geoip removed)"
+		;;
+	help|-h|--help) cmd_help ;;
+	*)
+		echo "Unknown command: $1" >&2
+		cmd_help
+		exit 1
+		;;
+esac

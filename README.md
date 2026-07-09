@@ -12,6 +12,7 @@ LuCI UI: **Network → Route Profiles**
 - Built-in `direct` profile (default)
 - Import profiles via CLI or LuCI paste
 - Selective domain routing (nftables), up to 8 blocks / devices
+- Remote lists: plain text, Xray text, sing-box JSON, plus binary `geosite.dat` / `geoip.dat` / `geosite.db` / `geoip.db` / `.srs` (decoded by a small Rust helper shipped in the package)
 - GeoIP WAN bypass from a prefix-list URL + domains
 - Boot re-apply (`/etc/init.d/route-profiles`), domain/GeoIP refresh every 30 min via cron
 - Upgrade from former **vpn-switch**: imports old profiles/UCI, then applies DIRECT
@@ -19,7 +20,8 @@ LuCI UI: **Network → Route Profiles**
 ## Requirements
 
 - OpenWrt 23.05+ (CI builds 23.05, 24.10, SNAPSHOT)
-- `nftables`, `luci-base`, `ca-bundle` (declared package deps)
+- `nftables`, `luci-base`, `ca-bundle`
+- Host **Rust** toolchain when building the package (CI/SDK installs rustup; crates are vendored)
 
 ## Install
 
@@ -30,10 +32,13 @@ scp route-profiles_*_all.ipk root@openwrt.lan:/tmp/
 ssh root@openwrt.lan opkg install /tmp/route-profiles_*_all.ipk
 ```
 
-Build in an OpenWrt SDK / buildroot:
+Build in an OpenWrt SDK / buildroot (this repo is an OpenWrt *feed* root):
 
 ```sh
-ln -s /path/to/route-profiles-luci package/route-profiles
+# feeds.conf:
+#   src-link routeprofiles /path/to/route-profiles-luci
+./scripts/feeds update routeprofiles
+./scripts/feeds install route-profiles
 make package/route-profiles/compile V=s
 ```
 
@@ -87,6 +92,8 @@ lists = [
   # "https://example.com/ai.lst",
   # "xray:https://example.com/geosite-ai.txt",
   # "sing-box:https://example.com/ai-rules.json",
+  # "geosite:openai@https://…/geosite.dat",
+  # "srs:https://…/geosite-openai.srs",
   # "/etc/route-profiles/lists/local.lst",
 ]
 
@@ -106,13 +113,45 @@ Each enabled selective block is independent of the default route and gets its ow
 
 ### Remote lists (`lists`)
 
-URL or path; optional `format:` prefix (default: auto-detect).
+URL or path; optional `format:` prefix (default: auto-detect for text/JSON).
 
 | Prefix | Format |
 |--------|--------|
 | *(none)* / `lst:` | One domain or IPv4/CIDR per line (`#` comments) |
-| `xray:` / `v2ray:` | `domain:`, `full:`, bare domains/IPs (`keyword:` / `regexp:` / `geosite:` skipped) |
-| `sing-box:` / `singbox:` / `sb:` | sing-box rule-set JSON (`domain`, `domain_suffix`, `ip_cidr`) |
+| `xray:` / `v2ray:` | Text geosite-style lines: `domain:`, `full:`, bare domains/IPs (`keyword:` / `regexp:` / `geosite:` skipped) |
+| `sing-box:` / `singbox:` / `sb:` | sing-box **source** rule-set JSON (`domain`, `domain_suffix`, `ip_cidr`) |
+| `geosite:CATEGORY@…` | V2Fly / Xray **`geosite.dat`** — extract one category (e.g. `openai`, `cn`) |
+| `geoip:CATEGORY@…` | V2Fly / Xray **`geoip.dat`** — extract one code (e.g. `cn`, `private`) |
+| `sing-geosite:CATEGORY@…` | sing-box **`geosite.db`** (aliases: `sb-geosite:`) |
+| `sing-geoip:CATEGORY@…` | sing-box **`geoip.db`** (aliases: `sb-geoip:`) |
+| `srs:…` | sing-box binary rule-set **`.srs`** (whole file; no category) |
+
+Binary formats are decoded by the **Rust** helper `route-profiles-geoextract` (shipped as a native binary in the ipk; ~400 KiB, no Python). List categories:
+
+```sh
+route-profiles-geoextract --list-categories geosite-dat /path/geosite.dat
+route-profiles-geoextract --list-categories geosite-db /path/geosite.db
+```
+
+Local helper rebuild (host):
+
+```sh
+cd route-profiles/geoextract && cargo build --release --offline
+./target/release/route-profiles-geoextract geosite-dat /path/geosite.dat openai
+```
+
+OpenWrt package source lives in `route-profiles/` (Makefile + files + geoextract).
+
+Examples:
+
+```toml
+lists = [
+  "geosite:openai@https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+  "geoip:private@https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+  "sing-geosite:openai@https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db",
+  "srs:https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs",
+]
+```
 
 Inline `domains` and list targets are merged. IPs/CIDRs go into nft; domains are resolved via DNS.
 

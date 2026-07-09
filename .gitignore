@@ -1,18 +1,23 @@
-# OpenWrt / local build output (repo root only)
-/*.ipk
-/*.ipk.md5
-/bin/
-/tmp/
-/dl/
-/staging_dir/
-/build_dir/
-
 # Editor / OS
 *~
-*.swp
+*.bak
+*.orig
 *.swo
+*.swp
 .DS_Store
 .idea/
 .vscode/
-*.orig
-*.bak
+
+# OpenWrt / local build output (repo root only)
+/bin/
+/build_dir/
+/dl/
+/staging_dir/
+/tmp/
+/*.ipk
+/*.ipk.md5
+
+# Rust geoextract
+route-profiles/geoextract/target/
+route-profiles/prebuilt/
+prebuilt-dl/

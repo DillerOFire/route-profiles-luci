@@ -2,43 +2,178 @@ name: Build OpenWrt package
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
   pull_request:
-    branches:
-      - main
-      - master
+    branches: [main, master]
   workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: "Also build OpenWrt 23.05 packages"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: OpenWrt ${{ matrix.version }} (x86_64 SDK)
+  # -------------------------------------------------------------------------
+  # 1) Cross-compile geoextract (Rust) — static musl, vendored crates
+  # -------------------------------------------------------------------------
+  rust:
+    name: rust ${{ matrix.rust_target }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        version:
-          - "23.05.5"
-          - "24.10.5"
-          - "SNAPSHOT"
+        include:
+          - rust_target: x86_64-unknown-linux-musl
+            docker_tag: x86_64-musl
+            artifact: geoextract-x86_64
+          - rust_target: aarch64-unknown-linux-musl
+            docker_tag: aarch64-musl
+            artifact: geoextract-aarch64
+          - rust_target: armv7-unknown-linux-musleabihf
+            docker_tag: armv7-musleabihf
+            artifact: geoextract-armv7
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Build route-profiles
+      - name: Cache cargo target
+        uses: actions/cache@v4
+        with:
+          path: route-profiles/geoextract/target
+          key: geoextract-${{ matrix.rust_target }}-${{ hashFiles('route-profiles/geoextract/Cargo.lock') }}
+          restore-keys: |
+            geoextract-${{ matrix.rust_target }}-
+
+      - name: Build static musl binary
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/route-profiles/geoextract:/home/rust/src" \
+            -w /home/rust/src \
+            "messense/rust-musl-cross:${{ matrix.docker_tag }}" \
+            cargo build --release --offline --target "${{ matrix.rust_target }}"
+          BIN="route-profiles/geoextract/target/${{ matrix.rust_target }}/release/route-profiles-geoextract"
+          test -x "$BIN"
+          ls -lh "$BIN"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: route-profiles/geoextract/target/${{ matrix.rust_target }}/release/route-profiles-geoextract
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 2) OpenWrt SDK → .ipk (prebuilt geoextract; no rustup in SDK)
+  # -------------------------------------------------------------------------
+  package:
+    name: ipk ${{ matrix.arch }} / ${{ matrix.version }}
+    needs: rust
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 (VMs / x86 routers)
+          - version: "24.10.5"
+            arch: x86_64
+            rust_artifact: geoextract-x86_64
+          # Filogic / MediaTek aarch64 (e.g. Banana Pi R3/R4)
+          - version: "24.10.5"
+            arch: aarch64_cortex-a53
+            rust_artifact: geoextract-aarch64
+          # Generic aarch64
+          - version: "24.10.5"
+            arch: aarch64_generic
+            rust_artifact: geoextract-aarch64
+          # Common 32-bit ARM (mt7621-class etc.)
+          - version: "24.10.5"
+            arch: arm_cortex-a7_neon-vfpv4
+            rust_artifact: geoextract-armv7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch prebuilt geoextract
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.rust_artifact }}
+          path: prebuilt-dl
+
+      - name: Stage prebuilt for Makefile
+        run: |
+          set -euo pipefail
+          BIN="$(find prebuilt-dl -type f -name 'route-profiles-geoextract' | head -1)"
+          test -n "$BIN" && test -f "$BIN"
+          # Package source is route-profiles/; Makefile looks for ./prebuilt/ next to it
+          mkdir -p route-profiles/prebuilt
+          cp "$BIN" route-profiles/prebuilt/route-profiles-geoextract
+          chmod 755 route-profiles/prebuilt/route-profiles-geoextract
+          ls -la route-profiles/prebuilt/
+
+      - name: Build OpenWrt package
         uses: openwrt/gh-action-sdk@v9
         env:
-          ARCH: x86_64-${{ matrix.version }}
-          FEEDNAME: route-profiles
+          # Feed names must be [A-Za-z0-9_]+ — hyphens break feeds.conf (prior CI failure)
+          ARCH: ${{ matrix.arch }}-${{ matrix.version }}
+          FEEDNAME: routeprofiles
           PACKAGES: route-profiles
+          # Skip luci/packages/routing feeds; deps resolved from SDK — large speedup
+          NO_DEFAULT_FEEDS: 1
           NO_REFRESH_CHECK: 1
           NO_SHFMT_CHECK: 1
-          V: sc
+          V: s
 
-      - name: Upload ipk artifacts
+      - name: Upload ipk
         uses: actions/upload-artifact@v4
         with:
-          name: route-profiles-openwrt-${{ matrix.version }}
-          path: bin/packages/*/route-profiles/*.ipk
+          name: route-profiles-${{ matrix.arch }}-${{ matrix.version }}
+          path: bin/packages/**/*.ipk
+          if-no-files-found: error
+          retention-days: 14
+
+  # Optional 23.05 (workflow_dispatch + full_matrix only)
+  package-23:
+    if: github.event_name == 'workflow_dispatch' && inputs.full_matrix
+    name: ipk ${{ matrix.arch }} / 23.05.5
+    needs: rust
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            rust_artifact: geoextract-x86_64
+          - arch: aarch64_cortex-a53
+            rust_artifact: geoextract-aarch64
+          - arch: arm_cortex-a7_neon-vfpv4
+            rust_artifact: geoextract-armv7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.rust_artifact }}
+          path: prebuilt-dl
+      - run: |
+          BIN="$(find prebuilt-dl -type f -name 'route-profiles-geoextract' | head -1)"
+          mkdir -p route-profiles/prebuilt
+          cp "$BIN" route-profiles/prebuilt/route-profiles-geoextract
+          chmod 755 route-profiles/prebuilt/route-profiles-geoextract
+      - uses: openwrt/gh-action-sdk@v9
+        env:
+          ARCH: ${{ matrix.arch }}-23.05.5
+          FEEDNAME: routeprofiles
+          PACKAGES: route-profiles
+          NO_DEFAULT_FEEDS: 1
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+          V: s
+      - uses: actions/upload-artifact@v4
+        with:
+          name: route-profiles-${{ matrix.arch }}-23.05.5
+          path: bin/packages/**/*.ipk
+          if-no-files-found: error
