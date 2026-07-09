@@ -15,7 +15,6 @@ LuCI UI: **Network → Route Profiles**
 - Remote lists: plain text, Xray text, sing-box JSON, plus binary `geosite.dat` / `geoip.dat` / `geosite.db` / `geoip.db` / `.srs` (decoded by a small Rust helper shipped in the package)
 - GeoIP WAN bypass from a prefix-list URL + domains
 - Boot re-apply (`/etc/init.d/route-profiles`), domain/GeoIP refresh every 30 min via cron
-- Upgrade from former **vpn-switch**: imports old profiles/UCI, then applies DIRECT
 
 ## Requirements
 
@@ -167,7 +166,6 @@ route-profiles apply <id|path>
 route-profiles import <path> [id]
 route-profiles delete <id>
 route-profiles update                 # refresh domain IPs / GeoIP (active profile)
-route-profiles migrate-legacy [--force]
 route-profiles teardown
 route-profiles help
 ```
@@ -182,23 +180,8 @@ config route-profiles 'settings'
 	option profiles_dir '/etc/route-profiles/profiles'
 	option wan_dev 'wan'
 	option wan_gw ''          # empty = auto from ifstatus/DHCP
-	option migrated_v2 '0'
 ```
 
-## Upgrade from vpn-switch / 1.x
-
-On install, `route-profiles migrate-legacy` runs once when needed:
-
-1. Imports TOML profiles from `/etc/vpn-switch/profiles/` if present
-2. Detects live 1.x route, selective, GeoIP, domain files
-3. Writes `legacy-snapshot.toml` (and simple slot profiles if old UCI had them)
-4. Backs up domain/prefix files under `/etc/route-profiles/backup/<timestamp>/`
-5. Tears down old rules/helpers, applies **DIRECT**
-
-```sh
-route-profiles apply legacy-snapshot   # restore previous policy
-route-profiles migrate-legacy --force  # re-run migration
-```
 
 ## License
 

@@ -145,20 +145,9 @@ define Package/route-profiles/postinst
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
 	mkdir -p /etc/route-profiles/profiles /etc/route-profiles/cache
-
-	# Import vpn-switch / 1.x setup if present, clean runtime, apply DIRECT
-	if [ -x /usr/bin/route-profiles ]; then
-		/usr/bin/route-profiles migrate-legacy || true
-	fi
-
-	# Remove leftover 1.x / old-package helpers
-	rm -f /usr/bin/vpn-ai-update /usr/bin/vpn-geoip-update /usr/bin/vpn-switch 2>/dev/null || true
-	rm -f /etc/init.d/vpn-switch 2>/dev/null || true
-
-	# Replace old crons (vpn-switch + route-profiles) with single update job
+	# Install cron job for domain/GeoIP refresh
 	if [ -f /etc/crontabs/root ]; then
-		grep -vF '/usr/bin/vpn-switch' /etc/crontabs/root 2>/dev/null | \
-			grep -vF '/usr/bin/route-profiles' > /etc/crontabs/root.new || true
+		grep -vF '/usr/bin/route-profiles' /etc/crontabs/root > /etc/crontabs/root.new 2>/dev/null || true
 		mv /etc/crontabs/root.new /etc/crontabs/root
 	fi
 	CRON='*/30 * * * * /usr/bin/route-profiles update >/dev/null 2>&1'

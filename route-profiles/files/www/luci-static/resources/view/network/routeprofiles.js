@@ -109,12 +109,6 @@ return view.extend({
 
 			container.appendChild(table);
 
-			if (this.legacyNote) {
-				var hasLegacy = profiles.some(function(p) { return p.id === "legacy-snapshot"; });
-				dom.content(this.legacyNote, [hasLegacy
-					? "Previous 1.x setup was saved as profile legacy-snapshot. Apply it to restore."
-					: ""]);
-			}
 		}.bind(this)).catch(function(err) {
 			dom.content(container, [E("p", {}, [this.formatError(err)])]);
 		}.bind(this));
@@ -254,11 +248,6 @@ return view.extend({
 			"type": "checkbox"
 		});
 
-		this.legacyNote = E("p", {
-			"class": "route-legacy-note",
-			"style": "font-style:italic"
-		});
-
 		this.updateBtn = E("button", {
 			"class": "cbi-button cbi-button-neutral route-update-btn",
 			"click": function() { this.handleUpdate(); }.bind(this)
@@ -281,8 +270,7 @@ return view.extend({
 					" ",
 					this.updateBtn
 				]),
-				this.statusEl,
-				this.legacyNote
+				this.statusEl
 			]),
 
 			E("div", { "class": "cbi-section" }, [

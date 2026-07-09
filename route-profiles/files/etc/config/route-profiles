@@ -4,4 +4,3 @@ config route-profiles 'settings'
 	option wan_dev 'wan'
 	# Leave wan_gw empty to auto-detect from ifstatus/DHCP; set explicitly if needed.
 	option wan_gw ''
-	option migrated_v2 '0'

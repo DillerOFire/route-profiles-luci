@@ -7,7 +7,7 @@ export PATH="/usr/bin:/usr/sbin:/bin:/sbin"
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# Legacy single-selective (v1/v2.0) — still torn down for upgrades
+# Compat single-selective table (torn down if present)
 AI_TABLE_ID="101"
 AI_TABLE_NAME="ai_vpn"
 AI_FWMARK_HEX="0x3"
@@ -43,7 +43,7 @@ P_ROUTE_GATEWAY=""
 P_SEL_COUNT="0"
 P_SEL_BLOB=""
 P_SEL_ANY="false"
-# First selective (compat for migrate writer / simple status)
+# First selective (first block (status/list summary))
 P_SEL_ENABLED=""
 P_SEL_DEVICE=""
 P_SEL_DOMAINS=""
@@ -239,7 +239,7 @@ profile_name_quick() {
 # profile_parse <file> [meta]
 # meta = skip domains/lists arrays (fast path for status/list)
 # Selective supports:
-#   [selective]              — legacy single block
+#   [selective]              — single block
 #   [selective.<name>]       — additional named blocks (different devices)
 #   [[selective]]            — TOML array-of-tables (multiple devices)
 profile_parse() {
@@ -655,80 +655,8 @@ profile_validate() {
 }
 
 # ---------------------------------------------------------------------------
-# TOML writer (migrate)
-# ---------------------------------------------------------------------------
-_toml_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g;s/"/\\"/g'
-}
-
-_write_string_array() {
-	local key="$1"
-	local values="$2"
-	local d
-	printf '%s = [\n' "$key"
-	if [ -n "$values" ]; then
-		printf '%s\n' "$values" | while IFS= read -r d; do
-			[ -z "$d" ] && continue
-			printf '\t"%s",\n' "$(_toml_escape "$d")"
-		done
-	fi
-	echo "]"
-}
-
-# write_profile <outpath>
-# Uses globals W_NAME W_DESC W_RTYPE W_RDEV W_RGW W_SEL_EN W_SEL_DEV
-# W_SEL_DOMAINS W_SEL_LISTS W_GEO_EN W_GEO_SOURCE W_GEO_DOMAINS W_GEO_LISTS
-write_profile() {
-	local out="$1"
-
-	{
-		printf 'name = "%s"\n' "$(_toml_escape "${W_NAME}")"
-		printf 'description = "%s"\n' "$(_toml_escape "${W_DESC}")"
-		echo ""
-		echo "[route]"
-		printf 'type = "%s"\n' "$(_toml_escape "${W_RTYPE}")"
-		if [ -n "$W_RDEV" ]; then
-			printf 'device = "%s"\n' "$(_toml_escape "$W_RDEV")"
-		fi
-		if [ -n "$W_RGW" ]; then
-			printf 'gateway = "%s"\n' "$(_toml_escape "$W_RGW")"
-		fi
-		echo ""
-		echo "[selective]"
-		printf 'enabled = %s\n' "${W_SEL_EN:-false}"
-		if [ -n "$W_SEL_DEV" ]; then
-			printf 'device = "%s"\n' "$(_toml_escape "$W_SEL_DEV")"
-		fi
-		_write_string_array "domains" "$W_SEL_DOMAINS"
-		_write_string_array "lists" "${W_SEL_LISTS:-}"
-		echo ""
-		echo "[geoip]"
-		printf 'enabled = %s\n' "${W_GEO_EN:-false}"
-		if [ -n "$W_GEO_SOURCE" ]; then
-			printf 'source_url = "%s"\n' "$(_toml_escape "$W_GEO_SOURCE")"
-		fi
-		_write_string_array "domains" "$W_GEO_DOMAINS"
-		_write_string_array "lists" "${W_GEO_LISTS:-}"
-	} > "$out"
-}
-
-# ---------------------------------------------------------------------------
 # Domain / IP helpers
 # ---------------------------------------------------------------------------
-domains_from_file() {
-	local file="$1"
-	[ -r "$file" ] || return 0
-	while IFS= read -r domain || [ -n "$domain" ]; do
-		case "$domain" in
-			""|\#*) continue ;;
-		esac
-		case "$domain" in
-			\*.*) domain=${domain#*.} ;;
-		esac
-		printf '%s\n' "$domain"
-	done < "$file"
-}
-
 is_ipv4_or_cidr() {
 	echo "$1" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'
 }
@@ -1142,11 +1070,11 @@ collect_targets() {
 # ---------------------------------------------------------------------------
 # Routing teardown / setup
 # ---------------------------------------------------------------------------
-# Tear down legacy single-selective + all multi-selective slots
+# Tear down single-selective + all multi-selective slots
 selective_teardown() {
 	local i tid tname mark nftt
 
-	# Legacy v2.0 single selective
+	# Compat single-selective table (ai_route / fwmark 0x3)
 	while ip rule del fwmark $AI_FWMARK_HEX lookup $AI_TABLE_ID 2>/dev/null; do :; done
 	while ip rule del fwmark $AI_FWMARK_HEX lookup $AI_TABLE_NAME 2>/dev/null; do :; done
 	ip route flush table $AI_TABLE_ID 2>/dev/null || true
@@ -1634,7 +1562,7 @@ cmd_update() {
 			[ -z "$slot" ] && continue
 			nftt=$(sel_slot_nft_table "$slot")
 			if ! nft list set $SEL_NF_FAMILY "$nftt" $SEL_NF_SET >/dev/null 2>&1; then
-				# Legacy single table (older apply)
+				# Compat single-selective table (older apply)
 				if [ "$slot" = "0" ] && nft list set $AI_NF_FAMILY $AI_NF_TABLE $AI_NF_SET >/dev/null 2>&1; then
 					nftt=""
 				else
@@ -1660,7 +1588,7 @@ cmd_update() {
 				echo "Refreshing selective[$label] domain IPs (slot $slot)..."
 				sync_targets_to_set "$SEL_NF_FAMILY" "$nftt" "$SEL_NF_SET" "$sel_targets" || true
 			elif [ "$slot" = "0" ] && nft list set $AI_NF_FAMILY $AI_NF_TABLE $AI_NF_SET >/dev/null 2>&1; then
-				echo "Refreshing selective domain IPs (legacy table)..."
+				echo "Refreshing selective domain IPs (compat table)..."
 				sync_targets_to_set "$AI_NF_FAMILY" "$AI_NF_TABLE" "$AI_NF_SET" "$sel_targets" || true
 			fi
 		done < "$slots_file"
@@ -1770,11 +1698,11 @@ cmd_status() {
 	ip route show table main 2>/dev/null | grep '^default' || echo "(no default route)"
 	echo ""
 	any_live=0
-	# Legacy single table
+	# Compat single-selective table
 	if ip rule show 2>/dev/null | grep -Eq "fwmark $AI_FWMARK_HEX lookup ($AI_TABLE_NAME|$AI_TABLE_ID)"; then
 		count=$(nft list set $AI_NF_FAMILY $AI_NF_TABLE $AI_NF_SET 2>/dev/null | grep -cE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' 2>/dev/null)
 		count=${count:-0}
-		echo "Selective routing: ACTIVE legacy (fwmark $AI_FWMARK_HEX, $count IPs)"
+		echo "Selective routing: ACTIVE (compat) (fwmark $AI_FWMARK_HEX, $count IPs)"
 		any_live=1
 	fi
 	i=0
@@ -1918,284 +1846,6 @@ cmd_delete() {
 }
 
 # ---------------------------------------------------------------------------
-# Legacy detection helpers
-# ---------------------------------------------------------------------------
-legacy_selective_active() {
-	nft list table $AI_NF_FAMILY $AI_NF_TABLE >/dev/null 2>&1 || selective_active
-}
-
-legacy_geoip_active() {
-	nft list table $GEOIP_NF_FAMILY $GEOIP_NF_TABLE >/dev/null 2>&1 || geoip_active
-}
-
-detect_legacy_route() {
-	# returns: type|device  e.g. direct|wan  or interface|awg_brr
-	local def awg wgi warp enwarp wdev
-	def=$(live_default_dev)
-	# Prefer former vpn-switch UCI when detecting 1.x state
-	wdev=$(uci -q get vpn-switch.settings.wan_dev 2>/dev/null \
-		|| uci -q get route-profiles.settings.wan_dev 2>/dev/null || echo "wan")
-	awg=$(uci -q get vpn-switch.settings.awg_brr 2>/dev/null \
-		|| uci -q get route-profiles.settings.awg_brr 2>/dev/null || echo "awg_brr")
-	wgi=$(uci -q get vpn-switch.settings.wgi 2>/dev/null \
-		|| uci -q get route-profiles.settings.wgi 2>/dev/null || echo "wgi")
-	warp=$(uci -q get vpn-switch.settings.awg_warp 2>/dev/null \
-		|| uci -q get route-profiles.settings.awg_warp 2>/dev/null || echo "awg_warp")
-	enwarp=$(uci -q get vpn-switch.settings.awg_enwarp 2>/dev/null \
-		|| uci -q get route-profiles.settings.awg_enwarp 2>/dev/null || echo "awg_enwarp")
-
-	if [ -z "$def" ] || [ "$def" = "$wdev" ]; then
-		echo "direct|$wdev"
-		return
-	fi
-	case "$def" in
-		"$awg"|"$wgi"|"$warp"|"$enwarp")
-			echo "interface|$def"
-			return
-			;;
-	esac
-	# unknown device — treat as interface if not wan
-	if [ "$def" != "$wdev" ]; then
-		echo "interface|$def"
-	else
-		echo "direct|$wdev"
-	fi
-}
-
-# Write a simple interface-only profile for a migrated VPN slot
-migrate_write_slot() {
-	local id="$1"
-	local dev="$2"
-	local name="$3"
-	local force="${4:-0}"
-	local path
-
-	[ -z "$dev" ] && return 0
-	[ "$id" = "direct" ] && return 0
-	path=$(profile_path "$id")
-	if [ -f "$path" ] && [ "$force" -eq 0 ]; then
-		echo "Keeping existing $id.toml"
-		return 0
-	fi
-	W_NAME="$name"
-	W_DESC="Migrated from 1.x settings ($dev)"
-	W_RTYPE="interface"
-	W_RDEV="$dev"
-	W_RGW=""
-	W_SEL_EN="false"
-	W_SEL_DEV=""
-	W_SEL_DOMAINS=""
-	W_SEL_LISTS=""
-	W_GEO_EN="false"
-	W_GEO_SOURCE=""
-	W_GEO_DOMAINS=""
-	W_GEO_LISTS=""
-	write_profile "$path"
-	echo "Saved: $path"
-}
-
-# ---------------------------------------------------------------------------
-# migrate-legacy
-# ---------------------------------------------------------------------------
-cmd_migrate_legacy() {
-	local force=0
-	local migrated dir backup_ts backup_dir
-	local rtype rdev
-	local sel_en=false sel_dev="" sel_domains=""
-	local geo_en=false geo_source="" geo_domains=""
-	local snap slot_dev slot_id
-	local old_ai old_geo old_prefix
-	# Former package name (vpn-switch) — still scanned for 1.x artifacts
-	local legacy_pkg="vpn-switch"
-	local legacy_root="/etc/vpn-switch"
-
-	[ "$1" = "--force" ] && force=1
-
-	migrated=$(uci_get "settings.migrated_v2" "0")
-	if [ "$migrated" = "1" ] && [ "$force" -eq 0 ]; then
-		echo "Already migrated to v2 (use --force to re-run)"
-		return 0
-	fi
-
-	dir=$(profiles_dir)
-	mkdir -p "$dir" "$(cache_dir)"
-	backup_ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d%H%M%S')
-	backup_dir="/etc/route-profiles/backup/$backup_ts"
-	mkdir -p "$backup_dir"
-
-	echo "=== Migrating legacy routing setup (vpn-switch → route-profiles) ==="
-
-	# Prefer old package UCI, then current package, then defaults
-	local wdev wgw
-	wdev=$(uci -q get "${legacy_pkg}.settings.wan_dev" 2>/dev/null \
-		|| uci -q get route-profiles.settings.wan_dev 2>/dev/null \
-		|| echo "wan")
-	wgw=$(uci -q get "${legacy_pkg}.settings.wan_gw" 2>/dev/null \
-		|| uci -q get route-profiles.settings.wan_gw 2>/dev/null \
-		|| echo "")
-
-	# Copy any existing TOML profiles from old package tree
-	if [ -d "${legacy_root}/profiles" ]; then
-		for f in "${legacy_root}/profiles"/*.toml; do
-			[ -f "$f" ] || continue
-			base=$(basename "$f")
-			if [ ! -f "$dir/$base" ] || [ "$force" -eq 1 ]; then
-				cp "$f" "$dir/$base" 2>/dev/null || true
-				echo "Imported profile: $base"
-			fi
-		done
-	fi
-
-	# Detect live route
-	rtype=$(detect_legacy_route | cut -d'|' -f1)
-	rdev=$(detect_legacy_route | cut -d'|' -f2)
-
-	# Selective (1.x files under old package path)
-	old_ai="${legacy_root}/ai-domains"
-	sel_dev=$(uci -q get "${legacy_pkg}.ai_route.interface" 2>/dev/null || echo "")
-	if legacy_selective_active; then
-		sel_en=true
-		[ -z "$sel_dev" ] && sel_dev="${rdev}"
-	fi
-	if [ -r "$old_ai" ]; then
-		sel_domains=$(domains_from_file "$old_ai")
-		cp "$old_ai" "$backup_dir/ai-domains" 2>/dev/null || true
-	fi
-	[ -z "$sel_dev" ] && sel_dev=$(uci -q get "${legacy_pkg}.ai_route.interface" 2>/dev/null || echo "awg_brr")
-
-	# GeoIP
-	old_geo="${legacy_root}/geoip-domains"
-	old_prefix=$(uci -q get "${legacy_pkg}.geoip.prefixes_file" 2>/dev/null || echo "${legacy_root}/geoip-ru.zone")
-	geo_source=$(uci -q get "${legacy_pkg}.geoip.source_url" 2>/dev/null || \
-		echo "https://www.ipdeny.com/ipblocks/data/countries/ru.zone")
-	if legacy_geoip_active; then
-		geo_en=true
-	fi
-	if [ -r "$old_geo" ]; then
-		geo_domains=$(domains_from_file "$old_geo")
-		cp "$old_geo" "$backup_dir/geoip-domains" 2>/dev/null || true
-	fi
-	if [ -r "$old_prefix" ]; then
-		cp "$old_prefix" "$(geoip_cache_file "$geo_source")" 2>/dev/null || true
-		cp "$old_prefix" "$backup_dir/$(basename "$old_prefix")" 2>/dev/null || true
-	fi
-
-	# Write legacy-snapshot only if 1.x artifacts exist
-	snap=$(profile_path "legacy-snapshot")
-	has_legacy=0
-	[ -r "$old_ai" ] && has_legacy=1
-	[ -r "$old_geo" ] && has_legacy=1
-	uci -q get "${legacy_pkg}.ai_route.interface" >/dev/null 2>&1 && has_legacy=1
-	uci -q get "${legacy_pkg}.geoip.source_url" >/dev/null 2>&1 && has_legacy=1
-	uci -q get "${legacy_pkg}.geoip.country" >/dev/null 2>&1 && has_legacy=1
-	uci -q get "${legacy_pkg}.settings.awg_brr" >/dev/null 2>&1 && has_legacy=1
-	[ "$sel_en" = "true" ] && has_legacy=1
-	[ "$geo_en" = "true" ] && has_legacy=1
-	[ "$rtype" = "interface" ] && has_legacy=1
-
-	if [ -f "$snap" ] && [ "$force" -eq 0 ] && [ "$migrated" = "1" ]; then
-		echo "Keeping existing legacy-snapshot.toml"
-	elif [ "$has_legacy" -eq 1 ] || [ "$force" -eq 1 ]; then
-		W_NAME="Legacy snapshot"
-		W_DESC="Auto-migrated from vpn-switch at $backup_ts"
-		W_RTYPE="$rtype"
-		W_RDEV="$rdev"
-		W_RGW="$wgw"
-		W_SEL_EN="$sel_en"
-		W_SEL_DEV="$sel_dev"
-		W_SEL_DOMAINS="$sel_domains"
-		W_SEL_LISTS=""
-		W_GEO_EN="$geo_en"
-		W_GEO_SOURCE="$geo_source"
-		W_GEO_DOMAINS="$geo_domains"
-		W_GEO_LISTS=""
-		write_profile "$snap"
-		echo "Saved: $snap"
-	else
-		echo "No 1.x artifacts found; skipping legacy-snapshot"
-	fi
-
-	# Per-slot simple profiles only when 1.x UCI defined them
-	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_brr" 2>/dev/null || true)
-	[ -n "$slot_dev" ] && migrate_write_slot "brr" "$slot_dev" "BRR" "$force"
-	slot_dev=$(uci -q get "${legacy_pkg}.settings.wgi" 2>/dev/null || true)
-	[ -n "$slot_dev" ] && migrate_write_slot "wgi" "$slot_dev" "WGI" "$force"
-	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_warp" 2>/dev/null || true)
-	[ -n "$slot_dev" ] && migrate_write_slot "awg-warp" "$slot_dev" "AWG WARP" "$force"
-	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_enwarp" 2>/dev/null || true)
-	[ -n "$slot_dev" ] && migrate_write_slot "awg-enwarp" "$slot_dev" "AWG ENWARP" "$force"
-
-	# Ensure direct.toml exists
-	if [ ! -f "$(profile_path direct)" ]; then
-		W_NAME="DIRECT"
-		W_DESC="Direct WAN, no VPN"
-		W_RTYPE="direct"
-		W_RDEV="$wdev"
-		W_RGW="$wgw"
-		W_SEL_EN="false"
-		W_SEL_DEV=""
-		W_SEL_DOMAINS=""
-		W_SEL_LISTS=""
-		W_GEO_EN="false"
-		W_GEO_SOURCE=""
-		W_GEO_DOMAINS=""
-		W_GEO_LISTS=""
-		write_profile "$(profile_path direct)"
-	fi
-
-	echo "=== Cleaning legacy runtime state ==="
-	teardown_all
-
-	# ifdown warp-like ifaces if present
-	for d in \
-		"$(uci -q get "${legacy_pkg}.settings.awg_warp" 2>/dev/null || echo awg_warp)" \
-		"$(uci -q get "${legacy_pkg}.settings.awg_enwarp" 2>/dev/null || echo awg_enwarp)"
-	do
-		if ip link show "$d" >/dev/null 2>&1; then
-			ifdown "$d" 2>/dev/null || true
-		fi
-	done
-
-	# Backup + remove old domain files
-	[ -f "$old_ai" ] && rm -f "$old_ai"
-	[ -f "$old_geo" ] && rm -f "$old_geo"
-	[ -f "$old_prefix" ] && [ "$old_prefix" != "$(geoip_cache_file "$geo_source")" ] && rm -f "$old_prefix"
-
-	# Drop old package UCI + 1.x sections
-	uci -q delete "${legacy_pkg}.ai_route" 2>/dev/null || true
-	uci -q delete "${legacy_pkg}.geoip" 2>/dev/null || true
-	uci -q delete "${legacy_pkg}" 2>/dev/null || true
-	uci -q commit "${legacy_pkg}" 2>/dev/null || true
-	# luci leftover
-	uci -q delete luci.ai_route 2>/dev/null || true
-	uci -q commit luci 2>/dev/null || true
-
-	# Ensure settings section on new package
-	uci -q set route-profiles.settings=route-profiles 2>/dev/null || \
-		uci set route-profiles.settings=route-profiles
-	uci_set "settings.active" "direct"
-	uci_set "settings.profiles_dir" "$dir"
-	uci_set "settings.wan_dev" "$wdev"
-	uci_set "settings.wan_gw" "$wgw"
-	uci_set "settings.migrated_v2" "1"
-	uci_commit_vs
-
-	# Remove leftover helper scripts (package no longer ships them)
-	rm -f /usr/bin/vpn-ai-update /usr/bin/vpn-geoip-update /usr/bin/vpn-switch 2>/dev/null || true
-
-	echo "=== Applying DIRECT profile ==="
-	cmd_apply "direct"
-
-	echo "=== Migration complete ==="
-	echo "Previous setup saved as: legacy-snapshot"
-	echo "VPN slot profiles (if any): brr, wgi, awg-warp, awg-enwarp"
-	echo "Backups under: $backup_dir"
-	echo "Router is on DIRECT. Re-apply with: route-profiles apply legacy-snapshot"
-}
-
-# ---------------------------------------------------------------------------
-# Help
-# ---------------------------------------------------------------------------
 cmd_help() {
 	cat <<'EOF'
 route-profiles — TOML profile-driven routing for OpenWrt
@@ -2209,7 +1859,6 @@ Usage:
   route-profiles delete <id>
   route-profiles update
   route-profiles update-async
-  route-profiles migrate-legacy [--force]
   route-profiles teardown
   route-profiles help
 
@@ -2230,7 +1879,6 @@ case "${1:-status}" in
 	delete) cmd_delete "$2" ;;
 	update) cmd_update ;;
 	update-async) cmd_update_async ;;
-	migrate-legacy) shift; cmd_migrate_legacy "$@" ;;
 	teardown)
 		teardown_all
 		echo "Teardown complete (nft/ip rules for selective+geoip removed)"
