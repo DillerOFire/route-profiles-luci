@@ -1,0 +1,22 @@
+{
+	"luci-vpnswitch": {
+		"description": "Grant access to VPN Switch profile commands",
+		"read": {
+			"file": {
+				"/usr/bin/vpn-switch": [ "exec" ],
+				"/tmp/vpn-switch-upload.toml": [ "read" ]
+			},
+			"ubus": {
+				"file": [ "exec", "stat", "read" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/tmp/vpn-switch-upload.toml": [ "write" ]
+			},
+			"ubus": {
+				"file": [ "write" ]
+			}
+		}
+	}
+}

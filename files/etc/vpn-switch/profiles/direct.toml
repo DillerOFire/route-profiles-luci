@@ -1,0 +1,12 @@
+name = "DIRECT"
+description = "Direct WAN, no VPN"
+
+[route]
+type = "direct"
+device = "wan"
+
+[selective]
+enabled = false
+
+[geoip]
+enabled = false

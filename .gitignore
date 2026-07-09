@@ -1,0 +1,18 @@
+# OpenWrt / local build output (repo root only)
+/*.ipk
+/*.ipk.md5
+/bin/
+/tmp/
+/dl/
+/staging_dir/
+/build_dir/
+
+# Editor / OS
+*~
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+*.orig
+*.bak

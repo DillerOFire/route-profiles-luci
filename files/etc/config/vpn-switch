@@ -1,0 +1,7 @@
+config vpn-switch 'settings'
+	option active 'direct'
+	option profiles_dir '/etc/vpn-switch/profiles'
+	option wan_dev 'wan'
+	# Leave wan_gw empty to auto-detect from ifstatus/DHCP; set explicitly if needed.
+	option wan_gw ''
+	option migrated_v2 '0'

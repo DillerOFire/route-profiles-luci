@@ -1,0 +1,44 @@
+name: Build OpenWrt package
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: OpenWrt ${{ matrix.version }} (x86_64 SDK)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - "23.05.5"
+          - "24.10.5"
+          - "SNAPSHOT"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build vpn-switch
+        uses: openwrt/gh-action-sdk@v9
+        env:
+          ARCH: x86_64-${{ matrix.version }}
+          FEEDNAME: vpn-switch
+          PACKAGES: vpn-switch
+          NO_REFRESH_CHECK: 1
+          NO_SHFMT_CHECK: 1
+          V: sc
+
+      - name: Upload ipk artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpn-switch-openwrt-${{ matrix.version }}
+          path: bin/packages/*/vpn-switch/*.ipk
