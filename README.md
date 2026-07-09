@@ -57,7 +57,7 @@ route-profiles apply brr
 route-profiles apply direct
 ```
 
-Or use **Network → Route Profiles** in LuCI: apply / show / delete profiles, paste TOML to import, refresh domain/GeoIP sets.
+Or use **Network → Route Profiles** in LuCI: apply / edit / show / delete profiles, paste TOML to import, refresh domain/GeoIP sets.
 
 ## Profiles
 
