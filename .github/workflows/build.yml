@@ -3,6 +3,7 @@ name: Build OpenWrt package
 on:
   push:
     branches: [main, master]
+    tags: ["v*"]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -11,10 +12,18 @@ on:
         description: "Also build OpenWrt 23.05 packages"
         type: boolean
         default: false
+      publish_release:
+        description: "Publish/update GitHub Release with IPKs"
+        type: boolean
+        default: true
 
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   # -------------------------------------------------------------------------
@@ -177,3 +186,115 @@ jobs:
           name: route-profiles-${{ matrix.arch }}-23.05.5
           path: bin/packages/**/*.ipk
           if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # 3) Publish IPKs to GitHub Releases
+  # -------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: [package, package-23]
+    if: |
+      always() &&
+      needs.package.result == 'success' &&
+      (needs.package-23.result == 'success' || needs.package-23.result == 'skipped') &&
+      (
+        github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+        || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all IPK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Matches package job uploads only (not geoextract-*)
+          pattern: route-profiles-*
+          path: release-ipks
+          merge-multiple: false
+
+      - name: Collect and rename IPKs
+        id: meta
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Keep only the route-profiles package IPKs (skip toolchain leftovers if any)
+          find release-ipks -type f -name 'route-profiles_*.ipk' -print0 | while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            # Prefer unique names: already include arch in OpenWrt filename
+            cp -f "$f" "dist/$base"
+            echo "  + $base"
+          done
+          count="$(find dist -name '*.ipk' | wc -l | tr -d ' ')"
+          echo "Found $count IPK(s)"
+          test "$count" -ge 1
+          ls -lah dist/
+
+          # Version from Makefile unless this is a v* tag
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            VER="$(sed -n 's/^PKG_VERSION:=//p' route-profiles/Makefile | head -1 | tr -d '[:space:]')"
+            REL="$(sed -n 's/^PKG_RELEASE:=//p' route-profiles/Makefile | head -1 | tr -d '[:space:]')"
+            TAG="v${VER}"
+            # Optional: include release rev in body; tag stays vX.Y.Z for stable URL
+            echo "pkg_release=${REL}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          {
+            echo "## route-profiles ${TAG}"
+            echo
+            echo "OpenWrt IPK packages built from \`${GITHUB_SHA::7}\` on \`${GITHUB_REF_NAME}\`."
+            echo
+            echo "### Install (example)"
+            echo
+            echo '```sh'
+            echo "scp dist/route-profiles_*_aarch64_cortex-a53.ipk root@openwrt.lan:/tmp/"
+            echo "ssh root@openwrt.lan opkg install /tmp/route-profiles_*_aarch64_cortex-a53.ipk"
+            echo '```'
+            echo
+            echo "### Assets"
+            echo
+            echo "| File | Arch / notes |"
+            echo "|------|----------------|"
+            for f in dist/*.ipk; do
+              b="$(basename "$f")"
+              arch="$(echo "$b" | sed -n 's/.*_\([^_][^.]*\)\.ipk/\1/p')"
+              echo "| \`$b\` | \`${arch}\` |"
+            done
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Create release if missing; always re-upload assets for this tag
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing release $TAG"
+            # Drop previous route-profiles_*.ipk assets so names stay unique
+            mapfile -t OLD < <(gh release view "$TAG" --json assets -q '.assets[].name' | grep -E '^route-profiles_.*\.ipk$' || true)
+            for a in "${OLD[@]:-}"; do
+              [ -n "$a" ] || continue
+              gh release delete-asset "$TAG" "$a" --yes || true
+            done
+            gh release upload "$TAG" dist/*.ipk --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            echo "Creating release $TAG"
+            # main/master builds → prerelease so formal tags can be "latest"
+            PRE=()
+            if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+              PRE=(--prerelease --latest=false)
+            else
+              PRE=(--latest)
+            fi
+            gh release create "$TAG" dist/*.ipk \
+              --title "route-profiles ${TAG}" \
+              --notes-file release-notes.md \
+              "${PRE[@]}"
+          fi
+          echo "Release URL: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"

@@ -25,13 +25,15 @@ LuCI UI: **Network → Route Profiles**
 
 ## Install
 
-Download a `.ipk` from [GitHub Actions](../../actions) artifacts (or a release if published), then:
+Download a `.ipk` for your architecture from **[Releases](../../releases)** (CI publishes after each successful `main` build). Pick the file matching your device, e.g. `*_aarch64_cortex-a53.ipk` for MediaTek Filogic.
 
 ```sh
-scp route-profiles_*_all.ipk root@openwrt.lan:/tmp/
-ssh root@openwrt.lan opkg install /tmp/route-profiles_*_all.ipk
+# example: Filogic / aarch64_cortex-a53
+scp route-profiles_*_aarch64_cortex-a53.ipk root@openwrt.lan:/tmp/
+ssh root@openwrt.lan opkg install /tmp/route-profiles_*_aarch64_cortex-a53.ipk
 ```
 
+Also available as workflow artifacts under [Actions](../../actions). Tag `v*` creates a non-prerelease; pushes to `main` update the `vX.Y.Z` release from `PKG_VERSION` (marked prerelease until you cut a tag).
 Build in an OpenWrt SDK / buildroot (this repo is an OpenWrt *feed* root):
 
 ```sh
