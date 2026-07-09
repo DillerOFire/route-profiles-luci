@@ -1,6 +1,6 @@
 #!/bin/sh
-# vpn-switch 2.x — TOML profile-driven routing policy for OpenWrt
-# Profiles: /etc/vpn-switch/profiles/<id>.toml
+# route-profiles — TOML profile-driven routing policy for OpenWrt
+# Profiles: /etc/route-profiles/profiles/<id>.toml
 
 export PATH="/usr/bin:/usr/sbin:/bin:/sbin"
 
@@ -31,7 +31,7 @@ GEOIP_NF_SET="geoip_prefixes"
 GEOIP_DOMAIN_SET="geoip_domains"
 
 DOMAIN_TIMEOUT="3600"
-UPLOAD_TMP="/tmp/vpn-switch-upload.toml"
+UPLOAD_TMP="/tmp/route-profiles-upload.toml"
 
 # Parsed profile fields (set by profile_parse)
 P_NAME=""
@@ -57,19 +57,19 @@ P_GEO_LISTS=""
 # UCI helpers
 # ---------------------------------------------------------------------------
 uci_get() {
-	uci -q get "vpn-switch.$1" 2>/dev/null || echo "$2"
+	uci -q get "route-profiles.$1" 2>/dev/null || echo "$2"
 }
 
 uci_set() {
-	uci set "vpn-switch.$1=$2" 2>/dev/null
+	uci set "route-profiles.$1=$2" 2>/dev/null
 }
 
 uci_commit_vs() {
-	uci commit vpn-switch 2>/dev/null
+	uci commit route-profiles 2>/dev/null
 }
 
 profiles_dir() {
-	uci_get "settings.profiles_dir" "/etc/vpn-switch/profiles"
+	uci_get "settings.profiles_dir" "/etc/route-profiles/profiles"
 }
 
 wan_dev() {
@@ -117,7 +117,7 @@ profile_path() {
 }
 
 cache_dir() {
-	echo "/etc/vpn-switch/cache"
+	echo "/etc/route-profiles/cache"
 }
 
 # Cache path derived from source URL basename (e.g. ru.zone → geoip-ru.zone)
@@ -475,7 +475,7 @@ _parse_selective_blocks() {
 # Populate P_SEL_* globals from P_SEL_BLOB
 _sel_load_from_blob() {
 	local line kind idx label en dev rest
-	local tmp="/tmp/vpn-switch-sel-load.$$"
+	local tmp="/tmp/route-profiles-sel-load.$$"
 
 	P_SEL_COUNT=0
 	P_SEL_ANY="false"
@@ -586,7 +586,7 @@ _extract_string_array() {
 
 profile_validate() {
 	local line idx label en dev n_enabled
-	local tmp="/tmp/vpn-switch-sel-val.$$"
+	local tmp="/tmp/route-profiles-sel-val.$$"
 	local new_blob="" fixed=0
 
 	case "$P_ROUTE_TYPE" in
@@ -753,7 +753,7 @@ normalize_target() {
 
 resolve_domain_ipv4() {
 	local domain="$1"
-	local tmp="/tmp/vpn-switch-resolve.$$"
+	local tmp="/tmp/route-profiles-resolve.$$"
 	local pid i
 
 	nslookup "$domain" > "$tmp" 2>/dev/null &
@@ -863,13 +863,13 @@ list_fetch() {
 			return 1
 			;;
 		*)
-			# bare relative path under /etc/vpn-switch
+			# bare relative path under /etc/route-profiles
 			if [ -r "$url" ]; then
 				cp "$url" "$out"
 				return 0
 			fi
-			if [ -r "/etc/vpn-switch/$url" ]; then
-				cp "/etc/vpn-switch/$url" "$out"
+			if [ -r "/etc/route-profiles/$url" ]; then
+				cp "/etc/route-profiles/$url" "$out"
 				return 0
 			fi
 			return 1
@@ -927,7 +927,7 @@ parse_list_xray() {
 # Parse sing-box source rule-set JSON (and similar domain JSON)
 parse_list_singbox() {
 	local file="$1"
-	local tmp="/tmp/vpn-switch-sb-$$.txt"
+	local tmp="/tmp/route-profiles-sb-$$.txt"
 
 	# Prefer jsonfilter when available (OpenWrt)
 	if command -v jsonfilter >/dev/null 2>&1; then
@@ -978,8 +978,8 @@ parse_list_file() {
 expand_remote_lists() {
 	local lists="$1"
 	local entry tag raw parsed
-	local tmpdir="/tmp/vpn-switch-lists.$$"
-	local out="/tmp/vpn-switch-lists-out.$$"
+	local tmpdir="/tmp/route-profiles-lists.$$"
+	local out="/tmp/route-profiles-lists-out.$$"
 
 	: > "$out"
 	[ -z "$lists" ] && { cat "$out"; rm -f "$out"; return 0; }
@@ -1012,7 +1012,7 @@ expand_remote_lists() {
 collect_targets() {
 	local inline="$1"
 	local lists="$2"
-	local tmp="/tmp/vpn-switch-targets.$$"
+	local tmp="/tmp/route-profiles-targets.$$"
 	: > "$tmp"
 	if [ -n "$inline" ]; then
 		printf '%s\n' "$inline" | while IFS= read -r d; do
@@ -1213,9 +1213,9 @@ geoip_load_prefixes() {
 
 	cache=$(geoip_cache_file "$source")
 	tag=$(geoip_tmp_tag "$source")
-	tmp_raw="/tmp/vpn-geoip-${tag}.raw"
-	tmp_prefixes="/tmp/vpn-geoip-${tag}.zone"
-	tmp_nft="/tmp/vpn-geoip-${tag}.nft"
+	tmp_raw="/tmp/route-geoip-${tag}.raw"
+	tmp_prefixes="/tmp/route-geoip-${tag}.zone"
+	tmp_nft="/tmp/route-geoip-${tag}.nft"
 
 	mkdir -p "$(cache_dir)"
 
@@ -1357,11 +1357,11 @@ cmd_apply() {
 	local file id
 	local dev gw sel_dev
 	local slot line idx label sdev
-	local sel_tmp="/tmp/vpn-switch-apply-sel.$$"
+	local sel_tmp="/tmp/route-profiles-apply-sel.$$"
 	local any_sel=0
 
 	if [ -z "$target" ]; then
-		echo "Usage: vpn-switch apply <id|path>" >&2
+		echo "Usage: route-profiles apply <id|path>" >&2
 		return 1
 	fi
 
@@ -1393,7 +1393,7 @@ cmd_apply() {
 			dev="${P_ROUTE_DEVICE:-$(wan_dev)}"
 			gw="${P_ROUTE_GATEWAY:-$(wan_gw)}"
 			if [ -z "$gw" ]; then
-				echo "Error: no WAN gateway (set vpn-switch.settings.wan_gw or fix WAN DHCP)" >&2
+				echo "Error: no WAN gateway (set route-profiles.settings.wan_gw or fix WAN DHCP)" >&2
 				return 1
 			fi
 			echo "Default route: direct via $gw dev $dev"
@@ -1572,10 +1572,10 @@ cmd_update() {
 }
 
 cmd_update_async() {
-	local log="/tmp/vpn-switch-update.log"
+	local log="/tmp/route-profiles-update.log"
 	# Avoid stacking many refresh jobs
-	if [ -f /tmp/vpn-switch-update.pid ]; then
-		old=$(cat /tmp/vpn-switch-update.pid 2>/dev/null)
+	if [ -f /tmp/route-profiles-update.pid ]; then
+		old=$(cat /tmp/route-profiles-update.pid 2>/dev/null)
 		if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
 			echo "Domain/GeoIP refresh already running (pid $old, log $log)"
 			return 0
@@ -1583,10 +1583,10 @@ cmd_update_async() {
 	fi
 	(
 		echo "=== update start $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date) ==="
-		/usr/bin/vpn-switch update
+		/usr/bin/route-profiles update
 		echo "=== update end $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date) ==="
 	) > "$log" 2>&1 &
-	echo $! > /tmp/vpn-switch-update.pid
+	echo $! > /tmp/route-profiles-update.pid
 	echo "Domain/GeoIP refresh started in background (pid $!, log $log)"
 }
 
@@ -1731,7 +1731,7 @@ cmd_show() {
 	local id="$1"
 	local file
 	if [ -z "$id" ]; then
-		echo "Usage: vpn-switch show <id>" >&2
+		echo "Usage: route-profiles show <id>" >&2
 		return 1
 	fi
 	if [ -f "$id" ]; then
@@ -1755,7 +1755,7 @@ cmd_import() {
 	local dest dir
 
 	if [ -z "$src" ] || [ ! -r "$src" ]; then
-		echo "Usage: vpn-switch import <path> [id]" >&2
+		echo "Usage: route-profiles import <path> [id]" >&2
 		echo "Error: source not readable: $src" >&2
 		return 1
 	fi
@@ -1787,7 +1787,7 @@ cmd_delete() {
 	local file
 
 	if [ -z "$id" ]; then
-		echo "Usage: vpn-switch delete <id>" >&2
+		echo "Usage: route-profiles delete <id>" >&2
 		return 1
 	fi
 	if [ "$id" = "direct" ]; then
@@ -1822,11 +1822,17 @@ detect_legacy_route() {
 	# returns: type|device  e.g. direct|wan  or interface|awg_brr
 	local def awg wgi warp enwarp wdev
 	def=$(live_default_dev)
-	wdev=$(uci -q get vpn-switch.settings.wan_dev 2>/dev/null || echo "wan")
-	awg=$(uci -q get vpn-switch.settings.awg_brr 2>/dev/null || echo "awg_brr")
-	wgi=$(uci -q get vpn-switch.settings.wgi 2>/dev/null || echo "wgi")
-	warp=$(uci -q get vpn-switch.settings.awg_warp 2>/dev/null || echo "awg_warp")
-	enwarp=$(uci -q get vpn-switch.settings.awg_enwarp 2>/dev/null || echo "awg_enwarp")
+	# Prefer former vpn-switch UCI when detecting 1.x state
+	wdev=$(uci -q get vpn-switch.settings.wan_dev 2>/dev/null \
+		|| uci -q get route-profiles.settings.wan_dev 2>/dev/null || echo "wan")
+	awg=$(uci -q get vpn-switch.settings.awg_brr 2>/dev/null \
+		|| uci -q get route-profiles.settings.awg_brr 2>/dev/null || echo "awg_brr")
+	wgi=$(uci -q get vpn-switch.settings.wgi 2>/dev/null \
+		|| uci -q get route-profiles.settings.wgi 2>/dev/null || echo "wgi")
+	warp=$(uci -q get vpn-switch.settings.awg_warp 2>/dev/null \
+		|| uci -q get route-profiles.settings.awg_warp 2>/dev/null || echo "awg_warp")
+	enwarp=$(uci -q get vpn-switch.settings.awg_enwarp 2>/dev/null \
+		|| uci -q get route-profiles.settings.awg_enwarp 2>/dev/null || echo "awg_enwarp")
 
 	if [ -z "$def" ] || [ "$def" = "$wdev" ]; then
 		echo "direct|$wdev"
@@ -1889,6 +1895,9 @@ cmd_migrate_legacy() {
 	local geo_en=false geo_source="" geo_domains=""
 	local snap slot_dev slot_id
 	local old_ai old_geo old_prefix
+	# Former package name (vpn-switch) — still scanned for 1.x artifacts
+	local legacy_pkg="vpn-switch"
+	local legacy_root="/etc/vpn-switch"
 
 	[ "$1" = "--force" ] && force=1
 
@@ -1901,23 +1910,39 @@ cmd_migrate_legacy() {
 	dir=$(profiles_dir)
 	mkdir -p "$dir" "$(cache_dir)"
 	backup_ts=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d%H%M%S')
-	backup_dir="/etc/vpn-switch/backup/$backup_ts"
+	backup_dir="/etc/route-profiles/backup/$backup_ts"
 	mkdir -p "$backup_dir"
 
-	echo "=== Migrating legacy vpn-switch setup ==="
+	echo "=== Migrating legacy routing setup (vpn-switch → route-profiles) ==="
 
-	# Preserve WAN settings from old UCI if present
+	# Prefer old package UCI, then current package, then defaults
 	local wdev wgw
-	wdev=$(uci -q get vpn-switch.settings.wan_dev 2>/dev/null || echo "wan")
-	wgw=$(uci -q get vpn-switch.settings.wan_gw 2>/dev/null || echo "100.66.128.1")
+	wdev=$(uci -q get "${legacy_pkg}.settings.wan_dev" 2>/dev/null \
+		|| uci -q get route-profiles.settings.wan_dev 2>/dev/null \
+		|| echo "wan")
+	wgw=$(uci -q get "${legacy_pkg}.settings.wan_gw" 2>/dev/null \
+		|| uci -q get route-profiles.settings.wan_gw 2>/dev/null \
+		|| echo "")
+
+	# Copy any existing TOML profiles from old package tree
+	if [ -d "${legacy_root}/profiles" ]; then
+		for f in "${legacy_root}/profiles"/*.toml; do
+			[ -f "$f" ] || continue
+			base=$(basename "$f")
+			if [ ! -f "$dir/$base" ] || [ "$force" -eq 1 ]; then
+				cp "$f" "$dir/$base" 2>/dev/null || true
+				echo "Imported profile: $base"
+			fi
+		done
+	fi
 
 	# Detect live route
 	rtype=$(detect_legacy_route | cut -d'|' -f1)
 	rdev=$(detect_legacy_route | cut -d'|' -f2)
 
-	# Selective
-	old_ai="/etc/vpn-switch/ai-domains"
-	sel_dev=$(uci -q get vpn-switch.ai_route.interface 2>/dev/null || echo "")
+	# Selective (1.x files under old package path)
+	old_ai="${legacy_root}/ai-domains"
+	sel_dev=$(uci -q get "${legacy_pkg}.ai_route.interface" 2>/dev/null || echo "")
 	if legacy_selective_active; then
 		sel_en=true
 		[ -z "$sel_dev" ] && sel_dev="${rdev}"
@@ -1926,12 +1951,12 @@ cmd_migrate_legacy() {
 		sel_domains=$(domains_from_file "$old_ai")
 		cp "$old_ai" "$backup_dir/ai-domains" 2>/dev/null || true
 	fi
-	[ -z "$sel_dev" ] && sel_dev=$(uci -q get vpn-switch.ai_route.interface 2>/dev/null || echo "awg_brr")
+	[ -z "$sel_dev" ] && sel_dev=$(uci -q get "${legacy_pkg}.ai_route.interface" 2>/dev/null || echo "awg_brr")
 
 	# GeoIP
-	old_geo="/etc/vpn-switch/geoip-domains"
-	old_prefix=$(uci -q get vpn-switch.geoip.prefixes_file 2>/dev/null || echo "/etc/vpn-switch/geoip-ru.zone")
-	geo_source=$(uci -q get vpn-switch.geoip.source_url 2>/dev/null || \
+	old_geo="${legacy_root}/geoip-domains"
+	old_prefix=$(uci -q get "${legacy_pkg}.geoip.prefixes_file" 2>/dev/null || echo "${legacy_root}/geoip-ru.zone")
+	geo_source=$(uci -q get "${legacy_pkg}.geoip.source_url" 2>/dev/null || \
 		echo "https://www.ipdeny.com/ipblocks/data/countries/ru.zone")
 	if legacy_geoip_active; then
 		geo_en=true
@@ -1950,10 +1975,10 @@ cmd_migrate_legacy() {
 	has_legacy=0
 	[ -r "$old_ai" ] && has_legacy=1
 	[ -r "$old_geo" ] && has_legacy=1
-	uci -q get vpn-switch.ai_route.interface >/dev/null 2>&1 && has_legacy=1
-	uci -q get vpn-switch.geoip.source_url >/dev/null 2>&1 && has_legacy=1
-	uci -q get vpn-switch.geoip.country >/dev/null 2>&1 && has_legacy=1
-	uci -q get vpn-switch.settings.awg_brr >/dev/null 2>&1 && has_legacy=1
+	uci -q get "${legacy_pkg}.ai_route.interface" >/dev/null 2>&1 && has_legacy=1
+	uci -q get "${legacy_pkg}.geoip.source_url" >/dev/null 2>&1 && has_legacy=1
+	uci -q get "${legacy_pkg}.geoip.country" >/dev/null 2>&1 && has_legacy=1
+	uci -q get "${legacy_pkg}.settings.awg_brr" >/dev/null 2>&1 && has_legacy=1
 	[ "$sel_en" = "true" ] && has_legacy=1
 	[ "$geo_en" = "true" ] && has_legacy=1
 	[ "$rtype" = "interface" ] && has_legacy=1
@@ -1962,7 +1987,7 @@ cmd_migrate_legacy() {
 		echo "Keeping existing legacy-snapshot.toml"
 	elif [ "$has_legacy" -eq 1 ] || [ "$force" -eq 1 ]; then
 		W_NAME="Legacy snapshot"
-		W_DESC="Auto-migrated from vpn-switch 1.x at $backup_ts"
+		W_DESC="Auto-migrated from vpn-switch at $backup_ts"
 		W_RTYPE="$rtype"
 		W_RDEV="$rdev"
 		W_RGW="$wgw"
@@ -1981,13 +2006,13 @@ cmd_migrate_legacy() {
 	fi
 
 	# Per-slot simple profiles only when 1.x UCI defined them
-	slot_dev=$(uci -q get vpn-switch.settings.awg_brr 2>/dev/null || true)
+	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_brr" 2>/dev/null || true)
 	[ -n "$slot_dev" ] && migrate_write_slot "brr" "$slot_dev" "BRR" "$force"
-	slot_dev=$(uci -q get vpn-switch.settings.wgi 2>/dev/null || true)
+	slot_dev=$(uci -q get "${legacy_pkg}.settings.wgi" 2>/dev/null || true)
 	[ -n "$slot_dev" ] && migrate_write_slot "wgi" "$slot_dev" "WGI" "$force"
-	slot_dev=$(uci -q get vpn-switch.settings.awg_warp 2>/dev/null || true)
+	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_warp" 2>/dev/null || true)
 	[ -n "$slot_dev" ] && migrate_write_slot "awg-warp" "$slot_dev" "AWG WARP" "$force"
-	slot_dev=$(uci -q get vpn-switch.settings.awg_enwarp 2>/dev/null || true)
+	slot_dev=$(uci -q get "${legacy_pkg}.settings.awg_enwarp" 2>/dev/null || true)
 	[ -n "$slot_dev" ] && migrate_write_slot "awg-enwarp" "$slot_dev" "AWG ENWARP" "$force"
 
 	# Ensure direct.toml exists
@@ -2013,8 +2038,8 @@ cmd_migrate_legacy() {
 
 	# ifdown warp-like ifaces if present
 	for d in \
-		"$(uci -q get vpn-switch.settings.awg_warp 2>/dev/null || echo awg_warp)" \
-		"$(uci -q get vpn-switch.settings.awg_enwarp 2>/dev/null || echo awg_enwarp)"
+		"$(uci -q get "${legacy_pkg}.settings.awg_warp" 2>/dev/null || echo awg_warp)" \
+		"$(uci -q get "${legacy_pkg}.settings.awg_enwarp" 2>/dev/null || echo awg_enwarp)"
 	do
 		if ip link show "$d" >/dev/null 2>&1; then
 			ifdown "$d" 2>/dev/null || true
@@ -2026,22 +2051,18 @@ cmd_migrate_legacy() {
 	[ -f "$old_geo" ] && rm -f "$old_geo"
 	[ -f "$old_prefix" ] && [ "$old_prefix" != "$(geoip_cache_file "$geo_source")" ] && rm -f "$old_prefix"
 
-	# Rewrite UCI to v2 shape
-	# Delete old sections
-	uci -q delete vpn-switch.ai_route 2>/dev/null || true
-	uci -q delete vpn-switch.geoip 2>/dev/null || true
-	# Remove legacy interface name options if present
-	uci -q delete vpn-switch.settings.awg_brr 2>/dev/null || true
-	uci -q delete vpn-switch.settings.wgi 2>/dev/null || true
-	uci -q delete vpn-switch.settings.awg_warp 2>/dev/null || true
-	uci -q delete vpn-switch.settings.awg_enwarp 2>/dev/null || true
+	# Drop old package UCI + 1.x sections
+	uci -q delete "${legacy_pkg}.ai_route" 2>/dev/null || true
+	uci -q delete "${legacy_pkg}.geoip" 2>/dev/null || true
+	uci -q delete "${legacy_pkg}" 2>/dev/null || true
+	uci -q commit "${legacy_pkg}" 2>/dev/null || true
 	# luci leftover
 	uci -q delete luci.ai_route 2>/dev/null || true
 	uci -q commit luci 2>/dev/null || true
 
-	# Ensure settings section
-	uci -q set vpn-switch.settings=vpn-switch 2>/dev/null || \
-		uci set vpn-switch.settings=vpn-switch
+	# Ensure settings section on new package
+	uci -q set route-profiles.settings=route-profiles 2>/dev/null || \
+		uci set route-profiles.settings=route-profiles
 	uci_set "settings.active" "direct"
 	uci_set "settings.profiles_dir" "$dir"
 	uci_set "settings.wan_dev" "$wdev"
@@ -2050,7 +2071,7 @@ cmd_migrate_legacy() {
 	uci_commit_vs
 
 	# Remove leftover helper scripts (package no longer ships them)
-	rm -f /usr/bin/vpn-ai-update /usr/bin/vpn-geoip-update 2>/dev/null || true
+	rm -f /usr/bin/vpn-ai-update /usr/bin/vpn-geoip-update /usr/bin/vpn-switch 2>/dev/null || true
 
 	echo "=== Applying DIRECT profile ==="
 	cmd_apply "direct"
@@ -2059,7 +2080,7 @@ cmd_migrate_legacy() {
 	echo "Previous setup saved as: legacy-snapshot"
 	echo "VPN slot profiles (if any): brr, wgi, awg-warp, awg-enwarp"
 	echo "Backups under: $backup_dir"
-	echo "Router is on DIRECT. Re-apply with: vpn-switch apply legacy-snapshot"
+	echo "Router is on DIRECT. Re-apply with: route-profiles apply legacy-snapshot"
 }
 
 # ---------------------------------------------------------------------------
@@ -2067,22 +2088,22 @@ cmd_migrate_legacy() {
 # ---------------------------------------------------------------------------
 cmd_help() {
 	cat <<'EOF'
-vpn-switch — TOML profile-driven routing for OpenWrt
+route-profiles — TOML profile-driven routing for OpenWrt
 
 Usage:
-  vpn-switch status
-  vpn-switch list
-  vpn-switch show <id>
-  vpn-switch apply <id|path>
-  vpn-switch import <path> [id]
-  vpn-switch delete <id>
-  vpn-switch update
-  vpn-switch update-async
-  vpn-switch migrate-legacy [--force]
-  vpn-switch teardown
-  vpn-switch help
+  route-profiles status
+  route-profiles list
+  route-profiles show <id>
+  route-profiles apply <id|path>
+  route-profiles import <path> [id]
+  route-profiles delete <id>
+  route-profiles update
+  route-profiles update-async
+  route-profiles migrate-legacy [--force]
+  route-profiles teardown
+  route-profiles help
 
-Profiles live in /etc/vpn-switch/profiles/<id>.toml
+Profiles live in /etc/route-profiles/profiles/<id>.toml
 Default active profile: direct
 EOF
 }

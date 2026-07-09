@@ -1,0 +1,22 @@
+{
+	"luci-routeprofiles": {
+		"description": "Grant access to Route Profiles commands",
+		"read": {
+			"file": {
+				"/usr/bin/route-profiles": [ "exec" ],
+				"/tmp/route-profiles-upload.toml": [ "read" ]
+			},
+			"ubus": {
+				"file": [ "exec", "stat", "read" ]
+			}
+		},
+		"write": {
+			"file": {
+				"/tmp/route-profiles-upload.toml": [ "write" ]
+			},
+			"ubus": {
+				"file": [ "write" ]
+			}
+		}
+	}
+}

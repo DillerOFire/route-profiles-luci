@@ -1,0 +1,13 @@
+{
+	"admin/network/routeprofiles": {
+		"title": "Route Profiles",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "network/routeprofiles"
+		},
+		"depends": {
+			"acl": [ "luci-routeprofiles" ]
+		}
+	}
+}

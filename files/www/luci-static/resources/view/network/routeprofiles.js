@@ -4,11 +4,11 @@
 "require fs";
 "require ui";
 
-var UPLOAD_PATH = "/tmp/vpn-switch-upload.toml";
+var UPLOAD_PATH = "/tmp/route-profiles-upload.toml";
 
 return view.extend({
-	callVpnSwitch: function(args) {
-		return fs.exec("/usr/bin/vpn-switch", args).then(function(res) {
+	callRouteProfiles: function(args) {
+		return fs.exec("/usr/bin/route-profiles", args).then(function(res) {
 			return (res.stdout || "") + (res.stderr || "");
 		});
 	},
@@ -29,7 +29,7 @@ return view.extend({
 	},
 
 	refreshStatus: function() {
-		return this.callVpnSwitch(["status"]).then(function(output) {
+		return this.callRouteProfiles(["status"]).then(function(output) {
 			this.setStatusBox(output);
 			return output;
 		}.bind(this)).catch(function(err) {
@@ -60,7 +60,7 @@ return view.extend({
 		if (!container)
 			return Promise.resolve();
 
-		return this.callVpnSwitch(["list"]).then(function(output) {
+		return this.callRouteProfiles(["list"]).then(function(output) {
 			var profiles = this.parseList(output);
 			dom.content(container, []);
 
@@ -122,7 +122,7 @@ return view.extend({
 
 	handleApply: function(id) {
 		this.setOutput("Applying profile " + id + "...");
-		return this.callVpnSwitch(["apply", id]).then(function(output) {
+		return this.callRouteProfiles(["apply", id]).then(function(output) {
 			this.setOutput(output);
 			ui.addNotification(null, E("p", ["Applied profile " + id]));
 			return Promise.all([this.refreshStatus(), this.refreshList()]);
@@ -140,7 +140,7 @@ return view.extend({
 	},
 
 	handleShow: function(id) {
-		return this.callVpnSwitch(["show", id]).then(function(output) {
+		return this.callRouteProfiles(["show", id]).then(function(output) {
 			this.setOutput(output);
 		}.bind(this)).catch(function(err) {
 			this.setOutput(this.formatError(err));
@@ -150,7 +150,7 @@ return view.extend({
 	handleDelete: function(id) {
 		if (!window.confirm("Delete profile \"" + id + "\"?"))
 			return;
-		return this.callVpnSwitch(["delete", id]).then(function(output) {
+		return this.callRouteProfiles(["delete", id]).then(function(output) {
 			this.setOutput(output);
 			ui.addNotification(null, E("p", ["Deleted profile " + id]));
 			return this.refreshList();
@@ -165,9 +165,9 @@ return view.extend({
 		if (btn) btn.setAttribute("disabled", "true");
 		this.setOutput("Starting domain/GeoIP refresh in background...");
 		// Async: full DNS resolve can take minutes and exceeds LuCI XHR timeout
-		return this.callVpnSwitch(["update-async"]).then(function(output) {
+		return this.callRouteProfiles(["update-async"]).then(function(output) {
 			this.setOutput((output || "Background refresh started") +
-				"\n\nLog: /tmp/vpn-switch-update.log\nUse Refresh Status later to see IP counts.");
+				"\n\nLog: /tmp/route-profiles-update.log\nUse Refresh Status later to see IP counts.");
 			ui.addNotification(null, E("p", ["Domain/GeoIP refresh started in background"]));
 			return this.refreshStatus();
 		}.bind(this)).catch(function(err) {
@@ -194,7 +194,7 @@ return view.extend({
 			var args = ["import", UPLOAD_PATH];
 			if (id)
 				args.push(id);
-			return self.callVpnSwitch(args);
+			return self.callRouteProfiles(args);
 		}).then(function(output) {
 			self.setOutput(output);
 			ui.addNotification(null, E("p", ["Profile imported"]));
@@ -220,52 +220,52 @@ return view.extend({
 
 	render: function() {
 		this.statusEl = E("pre", {
-			"class": "vpn-switch-status",
+			"class": "route-profiles-status",
 			"style": "font-family:monospace; font-size:12px; white-space:pre-wrap; margin:5px 0"
 		}, ["Loading..."]);
 
-		this.profilesEl = E("div", { "class": "vpn-switch-profiles" }, [
+		this.profilesEl = E("div", { "class": "route-profiles-profiles" }, [
 			E("p", {}, ["Loading profiles..."])
 		]);
 
 		this.outputEl = E("textarea", {
-			"class": "vpn-switch-output",
+			"class": "route-profiles-output",
 			"style": "width:100%; font-family:monospace; white-space:pre; height:160px",
 			"readonly": true,
 			"wrap": "off"
 		});
 
 		this.uploadTa = E("textarea", {
-			"class": "vpn-upload-textarea",
+			"class": "route-upload-textarea",
 			"style": "width:100%; font-family:monospace; white-space:pre; height:200px",
 			"wrap": "off",
 			"placeholder": "Paste a .toml profile here..."
 		});
 
 		this.uploadIdInput = E("input", {
-			"class": "vpn-upload-id",
+			"class": "route-upload-id",
 			"type": "text",
 			"placeholder": "profile id (optional, e.g. brr)",
 			"style": "min-width:16em"
 		});
 
 		this.uploadApplyCheck = E("input", {
-			"class": "vpn-upload-apply",
+			"class": "route-upload-apply",
 			"type": "checkbox"
 		});
 
 		this.legacyNote = E("p", {
-			"class": "vpn-legacy-note",
+			"class": "route-legacy-note",
 			"style": "font-style:italic"
 		});
 
 		this.updateBtn = E("button", {
-			"class": "cbi-button cbi-button-neutral vpn-update-btn",
+			"class": "cbi-button cbi-button-neutral route-update-btn",
 			"click": function() { this.handleUpdate(); }.bind(this)
 		}, ["Update Domain/GeoIP Sets"]);
 
 		var view = E("div", { "class": "cbi-map" }, [
-			E("h2", {}, ["VPN Switch"]),
+			E("h2", {}, ["Route Profiles"]),
 			E("div", { "class": "cbi-map-descr" }, [
 				"Route traffic using TOML profiles. The default profile is DIRECT (WAN). ",
 				"Upload or apply another profile (for example BRR) to switch the router policy."

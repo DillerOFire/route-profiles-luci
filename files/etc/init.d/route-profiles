@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+# Re-apply active route-profiles TOML profile at boot
+
+START=99
+STOP=10
+USE_PROCD=0
+
+start_service() {
+	[ -x /usr/bin/route-profiles ] || return 0
+	local active
+	active=$(uci -q get route-profiles.settings.active 2>/dev/null || echo direct)
+	/usr/bin/route-profiles apply "$active" >/tmp/route-profiles-boot.log 2>&1 || true
+}
+
+start() {
+	start_service
+}
+
+stop() {
+	[ -x /usr/bin/route-profiles ] || return 0
+	/usr/bin/route-profiles teardown >/dev/null 2>&1 || true
+}
+
+restart() {
+	stop
+	start
+}
+
+boot() {
+	start
+}

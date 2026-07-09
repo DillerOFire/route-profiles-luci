@@ -1,6 +1,6 @@
-config vpn-switch 'settings'
+config route-profiles 'settings'
 	option active 'direct'
-	option profiles_dir '/etc/vpn-switch/profiles'
+	option profiles_dir '/etc/route-profiles/profiles'
 	option wan_dev 'wan'
 	# Leave wan_gw empty to auto-detect from ifstatus/DHCP; set explicitly if needed.
 	option wan_gw ''

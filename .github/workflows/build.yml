@@ -27,12 +27,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build vpn-switch
+      - name: Build route-profiles
         uses: openwrt/gh-action-sdk@v9
         env:
           ARCH: x86_64-${{ matrix.version }}
-          FEEDNAME: vpn-switch
-          PACKAGES: vpn-switch
+          FEEDNAME: route-profiles
+          PACKAGES: route-profiles
           NO_REFRESH_CHECK: 1
           NO_SHFMT_CHECK: 1
           V: sc
@@ -40,5 +40,5 @@ jobs:
       - name: Upload ipk artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vpn-switch-openwrt-${{ matrix.version }}
-          path: bin/packages/*/vpn-switch/*.ipk
+          name: route-profiles-openwrt-${{ matrix.version }}
+          path: bin/packages/*/route-profiles/*.ipk

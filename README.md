@@ -1,8 +1,8 @@
-# vpn-switch
+# route-profiles
 
 OpenWrt package that switches router routing with **TOML profiles**. Default is **DIRECT** (WAN). Apply another profile to change the default route and optional selective domain / GeoIP rules.
 
-LuCI UI: **Network → VPN Switch**
+LuCI UI: **Network → Route Profiles**
 
 > Profiles only control routing. WireGuard / AmneziaWG interfaces must already exist under OpenWrt **Network**.
 
@@ -13,8 +13,8 @@ LuCI UI: **Network → VPN Switch**
 - Import profiles via CLI or LuCI paste
 - Selective domain routing (nftables), up to 8 blocks / devices
 - GeoIP WAN bypass from a prefix-list URL + domains
-- Boot re-apply (`/etc/init.d/vpn-switch`), domain/GeoIP refresh every 30 min via cron
-- Upgrade from 1.x: snapshots old setup, cleans up, applies DIRECT
+- Boot re-apply (`/etc/init.d/route-profiles`), domain/GeoIP refresh every 30 min via cron
+- Upgrade from former **vpn-switch**: imports old profiles/UCI, then applies DIRECT
 
 ## Requirements
 
@@ -26,37 +26,36 @@ LuCI UI: **Network → VPN Switch**
 Download a `.ipk` from [GitHub Actions](../../actions) artifacts (or a release if published), then:
 
 ```sh
-scp vpn-switch_*_all.ipk root@openwrt.lan:/tmp/
-ssh root@openwrt.lan opkg install /tmp/vpn-switch_*_all.ipk
+scp route-profiles_*_all.ipk root@openwrt.lan:/tmp/
+ssh root@openwrt.lan opkg install /tmp/route-profiles_*_all.ipk
 ```
 
 Build in an OpenWrt SDK / buildroot:
 
 ```sh
-ln -s /path/to/vpn-switch-luci package/vpn-switch
-make package/vpn-switch/compile V=s
+ln -s /path/to/route-profiles-luci package/route-profiles
+make package/route-profiles/compile V=s
 ```
 
 ## Quick start
 
 ```sh
-# Status and available profiles
-vpn-switch status
-vpn-switch list
+route-profiles status
+route-profiles list
 
 # Use the shipped BRR example (adjust device name if needed)
-cp /etc/vpn-switch/profiles/brr.example.toml /etc/vpn-switch/profiles/brr.toml
-vpn-switch apply brr
+cp /etc/route-profiles/profiles/brr.example.toml /etc/route-profiles/profiles/brr.toml
+route-profiles apply brr
 
 # Back to WAN
-vpn-switch apply direct
+route-profiles apply direct
 ```
 
-Or use **Network → VPN Switch** in LuCI: apply / show / delete profiles, paste TOML to import, refresh domain/GeoIP sets.
+Or use **Network → Route Profiles** in LuCI: apply / show / delete profiles, paste TOML to import, refresh domain/GeoIP sets.
 
 ## Profiles
 
-Path: `/etc/vpn-switch/profiles/<id>.toml`
+Path: `/etc/route-profiles/profiles/<id>.toml`
 
 | Shipped file | Role |
 |--------------|------|
@@ -88,7 +87,7 @@ lists = [
   # "https://example.com/ai.lst",
   # "xray:https://example.com/geosite-ai.txt",
   # "sing-box:https://example.com/ai-rules.json",
-  # "/etc/vpn-switch/lists/local.lst",
+  # "/etc/route-profiles/lists/local.lst",
 ]
 
 # [selective.warp]
@@ -120,43 +119,44 @@ Inline `domains` and list targets are merged. IPs/CIDRs go into nft; domains are
 ## CLI
 
 ```sh
-vpn-switch status
-vpn-switch list
-vpn-switch show <id>
-vpn-switch apply <id|path>
-vpn-switch import <path> [id]
-vpn-switch delete <id>
-vpn-switch update                 # refresh domain IPs / GeoIP (active profile)
-vpn-switch migrate-legacy [--force]
-vpn-switch teardown
-vpn-switch help
+route-profiles status
+route-profiles list
+route-profiles show <id>
+route-profiles apply <id|path>
+route-profiles import <path> [id]
+route-profiles delete <id>
+route-profiles update                 # refresh domain IPs / GeoIP (active profile)
+route-profiles migrate-legacy [--force]
+route-profiles teardown
+route-profiles help
 ```
 
 ## UCI
 
-`/etc/config/vpn-switch`:
+`/etc/config/route-profiles`:
 
 ```uci
-config vpn-switch 'settings'
+config route-profiles 'settings'
 	option active 'direct'
-	option profiles_dir '/etc/vpn-switch/profiles'
+	option profiles_dir '/etc/route-profiles/profiles'
 	option wan_dev 'wan'
 	option wan_gw ''          # empty = auto from ifstatus/DHCP
 	option migrated_v2 '0'
 ```
 
-## Upgrade from 1.x
+## Upgrade from vpn-switch / 1.x
 
-On install, `vpn-switch migrate-legacy` runs once when needed:
+On install, `route-profiles migrate-legacy` runs once when needed:
 
-1. Detects live 1.x route, selective, GeoIP, domain files
-2. Writes `legacy-snapshot.toml` (and simple slot profiles if old UCI had them)
-3. Backs up domain/prefix files under `/etc/vpn-switch/backup/<timestamp>/`
-4. Tears down old rules/helpers, applies **DIRECT**
+1. Imports TOML profiles from `/etc/vpn-switch/profiles/` if present
+2. Detects live 1.x route, selective, GeoIP, domain files
+3. Writes `legacy-snapshot.toml` (and simple slot profiles if old UCI had them)
+4. Backs up domain/prefix files under `/etc/route-profiles/backup/<timestamp>/`
+5. Tears down old rules/helpers, applies **DIRECT**
 
 ```sh
-vpn-switch apply legacy-snapshot   # restore previous policy
-vpn-switch migrate-legacy --force  # re-run migration
+route-profiles apply legacy-snapshot   # restore previous policy
+route-profiles migrate-legacy --force  # re-run migration
 ```
 
 ## License

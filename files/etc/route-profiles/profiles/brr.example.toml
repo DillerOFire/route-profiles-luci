@@ -1,6 +1,6 @@
 # Example profile: default route via AmneziaWG BRR.
 # Copy to brr.toml (or upload via LuCI) and adjust device names.
-#   cp brr.example.toml brr.toml && vpn-switch apply brr
+#   cp brr.example.toml brr.toml && route-profiles apply brr
 #
 # Remote lists (optional): plain .lst, Xray domain lists, or sing-box JSON.
 #   lists = [
