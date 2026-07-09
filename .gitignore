@@ -1,7 +1,7 @@
 # Editor / OS
 *~
 *.bak
-*.orig
+# note: do not ignore *.orig globally — cargo vendor ships Cargo.toml.orig
 *.swo
 *.swp
 .DS_Store
