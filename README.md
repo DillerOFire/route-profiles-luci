@@ -15,6 +15,7 @@ LuCI UI: **Network → Route Profiles**
 - Remote lists: plain text, Xray text, sing-box JSON, plus binary `geosite.dat` / `geoip.dat` / `geosite.db` / `geoip.db` / `.srs` (decoded by a small Rust helper shipped in the package)
 - GeoIP WAN bypass from a prefix-list URL + domains
 - Boot re-apply (`/etc/init.d/route-profiles`), domain/GeoIP refresh every 30 min via cron
+- Automatic preservation of WireGuard/AmneziaWG endpoint paths before default-route changes, including nested tunnels
 
 ## Requirements
 

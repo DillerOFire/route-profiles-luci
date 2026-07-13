@@ -1116,6 +1116,69 @@ clear_main_defaults() {
 	done
 }
 
+# Print resolved IPv4 peer endpoints for a live WireGuard/AmneziaWG device.
+# Both tools expose endpoints as "<public-key>\t<address>:<port>".
+tunnel_endpoints_ipv4() {
+	local dev="$1"
+	local tool
+
+	for tool in awg wg; do
+		command -v "$tool" >/dev/null 2>&1 || continue
+		"$tool" show "$dev" endpoints 2>/dev/null || true
+	done | awk '
+		{
+			ep = $2
+			if (ep ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) {
+				sub(/:[0-9]+$/, "", ep)
+				print ep
+			}
+		}
+	' | sort -u
+}
+
+# Preserve a tunnel endpoint's working path before making that tunnel the
+# default route. The path may be direct WAN or another tunnel (nested VPN).
+# Without a host route, the endpoint follows the new default back into its own
+# interface and the tunnel recursively blackholes.
+pin_tunnel_endpoint_routes() {
+	local dev="$1"
+	local endpoints endpoint route route_dev route_via route_failed failed=0
+
+	endpoints=$(tunnel_endpoints_ipv4 "$dev")
+	[ -n "$endpoints" ] || return 0
+
+	for endpoint in $endpoints; do
+		route_failed=0
+		route=$(ip -4 route get "$endpoint" 2>/dev/null | head -n1)
+		route_dev=$(printf '%s\n' "$route" | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+		route_via=$(printf '%s\n' "$route" | awk '{for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}')
+
+		if [ -z "$route_dev" ]; then
+			echo "Error: cannot determine current route for tunnel endpoint $endpoint" >&2
+			route_failed=1
+		elif [ "$route_dev" = "$dev" ]; then
+			echo "Error: tunnel endpoint $endpoint already routes through $dev" >&2
+			route_failed=1
+		elif [ -n "$route_via" ]; then
+			ip route replace "$endpoint/32" via "$route_via" dev "$route_dev" 2>/dev/null || route_failed=1
+		else
+			ip route replace "$endpoint/32" dev "$route_dev" 2>/dev/null || route_failed=1
+		fi
+		if [ "$route_failed" -eq 0 ]; then
+			if [ -n "$route_via" ]; then
+				echo "Pinned tunnel endpoint $endpoint via $route_via dev $route_dev"
+			else
+				echo "Pinned tunnel endpoint $endpoint dev $route_dev"
+			fi
+		else
+			echo "Error: failed to preserve route for tunnel endpoint $endpoint" >&2
+			failed=1
+		fi
+	done
+
+	[ "$failed" -eq 0 ]
+}
+
 ensure_rt_table() {
 	local id="$1"
 	local name="$2"
@@ -1421,6 +1484,13 @@ cmd_apply() {
 
 	echo "Applying profile: ${P_NAME:-$id} ($file)"
 
+	# Resolve and protect the new default tunnel while the current route still
+	# works. This must happen before clear_main_defaults().
+	if [ "$P_ROUTE_TYPE" = "interface" ]; then
+		dev=$(ensure_net_device "$P_ROUTE_DEVICE") || return 1
+		pin_tunnel_endpoint_routes "$dev" || return 1
+	fi
+
 	# Tear down previous policy hooks
 	teardown_all
 
@@ -1445,12 +1515,6 @@ cmd_apply() {
 				echo "Error: profile $id has empty route.device" >&2
 				return 1
 			fi
-			dev=$(ensure_net_device "$P_ROUTE_DEVICE") || {
-				# restore direct as safety
-				gw=$(wan_gw)
-				[ -n "$gw" ] && ip route add default via "$gw" dev "$(wan_dev)" 2>/dev/null || true
-				return 1
-			}
 			if [ "$dev" != "$P_ROUTE_DEVICE" ]; then
 				echo "Default route: interface $P_ROUTE_DEVICE (device $dev)"
 			else
